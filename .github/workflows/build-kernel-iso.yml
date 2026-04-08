@@ -36,6 +36,7 @@ jobs:
             dwarves \
             file \
             flex \
+            linux-libc-dev \
             libelf-dev \
             libssl-dev \
             musl-tools \
