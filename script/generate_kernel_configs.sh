@@ -8,25 +8,9 @@ SOURCE_ROOT="${2:-$ROOT_DIR/kernel}"
 OUTPUT_DIR="${3:-$ROOT_DIR/kernel}"
 SUMMARY_FILE="$OUTPUT_DIR/generated-config-summary.md"
 
-declare -A VERSION_TO_SOURCE=(
-  ["5.10"]="linux-5.10.252"
-  ["5.15"]="linux-5.15.202"
-  ["6.1"]="linux-6.1.167"
-  ["6.6"]="linux-6.6.133"
-  ["6.12"]="linux-6.12.80"
-  ["6.18"]="linux-6.18.21"
-)
-
-declare -A VERSION_TO_REAL=(
-  ["5.10"]="5.10.252"
-  ["5.15"]="5.15.202"
-  ["6.1"]="6.1.167"
-  ["6.6"]="6.6.133"
-  ["6.12"]="6.12.80"
-  ["6.18"]="6.18.21"
-)
-
 VERSIONS=(5.10 5.15 6.1 6.6 6.12 6.18)
+declare -A VERSION_TO_SOURCE=()
+declare -A VERSION_TO_REAL=()
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -149,21 +133,51 @@ require_tool make
 require_tool gcc
 require_tool awk
 require_tool mktemp
+require_tool find
+require_tool sort
 
 [ -f "$BASE_CONFIG" ] || die "base config not found: $BASE_CONFIG"
 [ -d "$SOURCE_ROOT" ] || die "source root not found: $SOURCE_ROOT"
 [ -d "$OUTPUT_DIR" ] || die "output dir not found: $OUTPUT_DIR"
 
+find_source_dir_for_series() {
+  local version=$1
+  local -a candidates=()
+  local last_index
+
+  mapfile -t candidates < <(
+    find "$SOURCE_ROOT" -mindepth 1 -maxdepth 1 -type d -name "linux-$version*" -printf '%f\n' \
+      | sort -V
+  )
+
+  [ "${#candidates[@]}" -gt 0 ] || return 1
+  last_index=$((${#candidates[@]} - 1))
+  printf '%s/%s\n' "$SOURCE_ROOT" "${candidates[$last_index]}"
+}
+
+detect_real_version() {
+  local src=$1
+  local base=${src##*/}
+
+  if [[ "$base" =~ ^linux-([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  make -s -C "$src" kernelrelease
+}
+
 work_root="$(mktemp -d "${TMPDIR:-/tmp}/kernel-configs.XXXXXX")"
 trap 'rm -rf "$work_root"' EXIT
 
 for version in "${VERSIONS[@]}"; do
-  src="$SOURCE_ROOT/${VERSION_TO_SOURCE[$version]}"
+  src="$(find_source_dir_for_series "$version")" || die "missing source tree for $version under $SOURCE_ROOT"
+  VERSION_TO_SOURCE["$version"]="$(basename "$src")"
+  VERSION_TO_REAL["$version"]="$(detect_real_version "$src")"
   out="$work_root/out-$version"
   cfg="$out/.config"
   target="$OUTPUT_DIR/linux-$version.config"
 
-  [ -d "$src" ] || die "missing source tree for $version: $src"
   [ -x "$src/scripts/config" ] || die "missing scripts/config in $src"
 
   mkdir -p "$out"
