@@ -1,0 +1,16 @@
+﻿default 0
+timeout 1
+
+title Ubuntu 24.04 LiveOS
+	find --set-root /bzImage
+	kernel /bzImage
+	initrd /initrd.zst
+
+title commandline
+	commandline
+
+title reboot
+	reboot
+
+title halt
+	halt

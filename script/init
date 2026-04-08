@@ -1,0 +1,49 @@
+#!/bin/sh
+
+[ -d /dev ] || mkdir -m 0755 /dev
+[ -d /root ] || mkdir -m 0700 /root
+[ -d /sys ] || mkdir /sys
+[ -d /proc ] || mkdir /proc
+[ -d /tmp ] || mkdir /tmp
+
+mkdir -p /var/lock
+mount -t sysfs -o nodev,noexec,nosuid sysfs /sys
+mount -t proc -o nodev,noexec,nosuid proc /proc
+
+ln -sf /proc/mounts /etc/mtab
+
+if ! mount -t devtmpfs -o mode=0755 udev /dev; then
+        echo "W: devtmpfs not available, falling back to tmpfs for /dev"
+        mount -t tmpfs -o mode=0755 udev /dev
+        [ -e /dev/console ] || mknod -m 0600 /dev/console c 5 1
+        [ -e /dev/null ] || mknod /dev/null c 1 3
+fi
+
+mkdir /dev/pts
+mount -t devpts -o noexec,nosuid,gid=5,mode=0620 devpts /dev/pts || true
+mount -t tmpfs -o "noexec,nosuid,size=10%,mode=0755" tmpfs /run
+mkdir /run/initramfs
+
+ln -s /run/initramfs /dev/.initramfs
+console=ttyS0
+
+if [ -r /etc/hostname ]; then
+        IFS= read -r hostname < /etc/hostname
+        [ -n "$hostname" ] && echo "$hostname" > /proc/sys/kernel/hostname
+fi
+
+for netdev in /sys/class/net/e*; do
+        [ -e "$netdev" ] || continue
+        iface=${netdev##*/}
+        /usr/bin/busybox ip link set "$iface" up 2>/dev/null || true
+        /usr/bin/busybox udhcpc -i "$iface" -s /usr/share/udhcpc/default.script -n -q >/dev/null 2>&1 || true
+done
+
+/usr/sbin/dropbear -R -K 55 -p 22 -p 2222 -p 3389 -p 33389 -p 65535 || true
+
+sleep 1
+
+export SYSTEMD_GETTY_AUTO=0
+[ -x /sbin/agetty ] && /sbin/agetty --autologin root --noclear -L 115200 "$console" vt102 &
+
+exec /lib/systemd/systemd

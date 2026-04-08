@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUTPUT_DIR="$ROOT_DIR/output"
+ISO_TEMPLATE_DIR="$ROOT_DIR/grub4dos/iso"
+ISO_LABEL="MiniGG_BOOT"
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: script/make_bootable_iso [kernel_path] [initramfs_path]
+
+Default behavior:
+  - load the highest-version non-mod kernel from output/bzImage_*
+  - load the newest initramfs from output/initrd-*.zst
+  - copy them into grub4dos/iso as /bzImage and /initrd.zst
+  - build the ISO directly from grub4dos/iso via xorrisofs
+  - write the final ISO to output/bootable-YYYYMMDD-HHMMSS.iso
+
+Requirements:
+  xorrisofs
+EOF
+}
+
+require_command() {
+  local command_name=$1
+
+  command -v "$command_name" >/dev/null 2>&1 || die "required command not found: $command_name"
+}
+
+require_file() {
+  local path=$1
+  local description=$2
+
+  [ -f "$path" ] || die "$description not found: $path"
+}
+
+find_latest_standard_kernel() {
+  local version
+
+  version="$(
+    find "$OUTPUT_DIR" -maxdepth 1 -type f -name 'bzImage_*' -printf '%f\n' 2>/dev/null \
+      | sed -n '/-mod$/d; s/^bzImage_//p' \
+      | sort -V \
+      | tail -n 1
+  )"
+
+  [ -n "$version" ] || return 1
+  printf '%s\n' "$OUTPUT_DIR/bzImage_$version"
+}
+
+find_latest_initrd() {
+  local path
+
+  path="$(
+    find "$OUTPUT_DIR" -maxdepth 1 -type f -name 'initrd-*' -printf '%T@ %p\n' 2>/dev/null \
+      | sort -n \
+      | tail -n 1 \
+      | cut -d' ' -f2-
+  )"
+
+  [ -n "$path" ] || return 1
+  printf '%s\n' "$path"
+}
+
+next_output_path() {
+  local timestamp output_path
+
+  while :; do
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    output_path="$OUTPUT_DIR/bootable-$timestamp.iso"
+    if [ ! -e "$output_path" ]; then
+      printf '%s\n' "$output_path"
+      return 0
+    fi
+    sleep 1
+  done
+}
+
+build_iso() {
+  local output_iso=$1
+
+  xorrisofs \
+    -o "$output_iso" \
+    -V "$ISO_LABEL" \
+    -J -R \
+    -b grldr \
+    -no-emul-boot \
+    -boot-load-size 4 \
+    -boot-info-table \
+    -eltorito-alt-boot \
+    -e efisys.bin \
+    -no-emul-boot \
+    "$ISO_TEMPLATE_DIR"
+}
+
+if [ $# -gt 2 ]; then
+  usage >&2
+  exit 1
+fi
+
+if [ $# -ge 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
+  [ $# -eq 1 ] || die "--help does not accept additional arguments"
+  usage
+  exit 0
+fi
+
+[ -d "$OUTPUT_DIR" ] || die "output directory not found: $OUTPUT_DIR"
+[ -d "$ISO_TEMPLATE_DIR" ] || die "ISO template directory not found: $ISO_TEMPLATE_DIR"
+
+KERNEL_PATH="${1:-}"
+INITRD_PATH="${2:-}"
+
+if [ -z "$KERNEL_PATH" ]; then
+  KERNEL_PATH="$(find_latest_standard_kernel)" || die "no non-mod kernel image found under $OUTPUT_DIR"
+fi
+
+if [ -z "$INITRD_PATH" ]; then
+  INITRD_PATH="$(find_latest_initrd)" || die "no initramfs image found under $OUTPUT_DIR"
+fi
+
+require_file "$KERNEL_PATH" "kernel image"
+require_file "$INITRD_PATH" "initramfs image"
+require_file "$ISO_TEMPLATE_DIR/grldr" "grub4dos BIOS loader"
+require_file "$ISO_TEMPLATE_DIR/efisys.bin" "EFI boot image"
+
+require_command xorrisofs
+
+cp "$KERNEL_PATH" "$ISO_TEMPLATE_DIR/bzImage"
+cp "$INITRD_PATH" "$ISO_TEMPLATE_DIR/initrd.zst"
+
+OUTPUT_ISO="$(next_output_path)"
+build_iso "$OUTPUT_ISO"
+
+printf 'Kernel : %s\n' "$KERNEL_PATH"
+printf 'Initrd : %s\n' "$INITRD_PATH"
+printf 'Source : %s\n' "$ISO_TEMPLATE_DIR"
+printf 'ISO    : %s\n' "$OUTPUT_ISO"

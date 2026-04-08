@@ -1,0 +1,15 @@
+#!/bin/sh
+
+bb=/usr/bin/busybox
+
+case "$1" in
+        deconfig)
+                $bb route del default dev "$interface" 2>/dev/null || true
+                $bb ifconfig "$interface" 0.0.0.0
+                ;;
+        bound|renew)
+                $bb ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}" up
+                $bb route del default dev "$interface" 2>/dev/null || true
+                [ -n "$router" ] && $bb route add default gw "${router%% *}" dev "$interface"
+                ;;
+esac

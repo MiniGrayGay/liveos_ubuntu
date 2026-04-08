@@ -1,0 +1,17 @@
+# Build artifacts
+/sysroot/*
+!/sysroot/.gitkeep
+
+/output/*
+!/output/.gitkeep
+
+/build/*
+!/build/.gitkeep
+
+# Editor and OS temporary files
+/.vscode/
+/.idea/
+*.swp
+*.swo
+*~
+.DS_Store
