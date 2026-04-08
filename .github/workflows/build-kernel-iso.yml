@@ -1,0 +1,203 @@
+name: Build Kernel ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: Kernel version to build, for example 6.18.12
+        required: true
+        type: string
+      kernel_url:
+        description: Optional full kernel source URL. When set, skip automatic URL detection.
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            bzip2 \
+            ca-certificates \
+            cpio \
+            curl \
+            dwarves \
+            file \
+            flex \
+            libelf-dev \
+            libssl-dev \
+            musl-tools \
+            python3 \
+            xorriso \
+            xz-utils \
+            zstd
+
+      - name: Resolve kernel source URL
+        id: resolve
+        shell: bash
+        env:
+          INPUT_KERNEL_VERSION: ${{ inputs.kernel_version }}
+          INPUT_KERNEL_URL: ${{ inputs.kernel_url }}
+        run: |
+          set -euo pipefail
+
+          kernel_version="${INPUT_KERNEL_VERSION}"
+          kernel_url="${INPUT_KERNEL_URL}"
+
+          if [[ ! "$kernel_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "error: kernel_version must look like x.y.z, got: $kernel_version" >&2
+            exit 1
+          fi
+
+          if [[ -n "$kernel_url" ]]; then
+            resolved_url="$kernel_url"
+          else
+            major="${kernel_version%%.*}"
+            base_url="https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${kernel_version}"
+            for suffix in tar.xz tar.gz; do
+              candidate_url="${base_url}.${suffix}"
+              if curl -fsIL --retry 3 --retry-delay 2 "$candidate_url" >/dev/null; then
+                resolved_url="$candidate_url"
+                break
+              fi
+            done
+
+            if [[ -z "${resolved_url:-}" ]]; then
+              echo "error: could not resolve a kernel.org tarball for $kernel_version" >&2
+              exit 1
+            fi
+          fi
+
+          source_url_path="${resolved_url%%\#*}"
+          source_url_path="${source_url_path%%\?*}"
+          source_name="${source_url_path##*/}"
+          source_path="/tmp/${source_name}"
+
+          detected_version="$(
+            SOURCE_NAME="$source_name" python3 -c 'import os, re; name = os.environ["SOURCE_NAME"]; match = re.search(r"([0-9]+\.[0-9]+(?:\.[0-9]+)?)", name); assert match is not None; version = match.group(1); print(version if version.count(".") == 2 else version + ".0")'
+          )" || {
+            echo "error: could not detect kernel version from source file name: $source_name" >&2
+            exit 1
+          }
+
+          if [[ "$detected_version" != "$kernel_version" ]]; then
+            echo "error: kernel_version $kernel_version does not match source file version $detected_version" >&2
+            exit 1
+          fi
+
+          {
+            echo "resolved_url=$resolved_url"
+            echo "source_name=$source_name"
+            echo "source_path=$source_path"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Download kernel source
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "${{ steps.resolve.outputs.source_path }}" \
+            "${{ steps.resolve.outputs.resolved_url }}"
+          ls -lh "${{ steps.resolve.outputs.source_path }}"
+
+      - name: Build kernel outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./script/compile_kernel_outputs.sh "${{ steps.resolve.outputs.source_path }}"
+
+      - name: Build static userspace tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./script/build_static_busybox.sh
+          ./script/build_static_dropbearmulti.sh
+          ./script/build_static_sftp_server.sh
+
+      - name: Prepare initrd
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo ./script/setup_sysroot.sh -y
+          sudo ./script/export_sysroot.sh
+
+      - name: Build bootable ISO
+        id: package
+        shell: bash
+        env:
+          KERNEL_VERSION: ${{ inputs.kernel_version }}
+        run: |
+          set -euo pipefail
+
+          kernel_path="output/${KERNEL_VERSION}/bzImage"
+          [[ -f "$kernel_path" ]] || {
+            echo "error: expected standard kernel image at $kernel_path" >&2
+            exit 1
+          }
+
+          initrd_path="$(
+            find output -maxdepth 1 -type f -name 'initrd-*.zst' -printf '%T@ %p\n' \
+              | sort -n \
+              | tail -n 1 \
+              | cut -d' ' -f2-
+          )"
+          [[ -n "$initrd_path" ]] || {
+            echo "error: no initrd artifact found under output/" >&2
+            exit 1
+          }
+
+          ./script/make_bootable.sh "$kernel_path" "$initrd_path"
+
+          iso_path="$(
+            find output -maxdepth 1 -type f -name 'bootable-*.iso' -printf '%T@ %p\n' \
+              | sort -n \
+              | tail -n 1 \
+              | cut -d' ' -f2-
+          )"
+          [[ -n "$iso_path" ]] || {
+            echo "error: no ISO artifact found under output/" >&2
+            exit 1
+          }
+
+          artifact_dir="$RUNNER_TEMP/build-kernel-iso-artifacts"
+          mkdir -p "$artifact_dir"
+          cp "$kernel_path" "$artifact_dir/"
+          cp "output/${KERNEL_VERSION}/build-info.txt" "$artifact_dir/"
+          cp "$initrd_path" "$artifact_dir/"
+          cp "$iso_path" "$artifact_dir/"
+
+          printf '%s\n' \
+            "kernel_version=${KERNEL_VERSION}" \
+            "kernel_url=${{ steps.resolve.outputs.resolved_url }}" \
+            "source_archive=${{ steps.resolve.outputs.source_name }}" \
+            "source_archive_path=${{ steps.resolve.outputs.source_path }}" \
+            "kernel_path=${kernel_path}" \
+            "initrd_path=${initrd_path}" \
+            "iso_path=${iso_path}" \
+            >"$artifact_dir/metadata.txt"
+
+          {
+            echo "artifact_dir=$artifact_dir"
+            echo "iso_path=$iso_path"
+            echo "initrd_path=$initrd_path"
+            echo "kernel_path=$kernel_path"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-${{ inputs.kernel_version }}
+          path: ${{ steps.package.outputs.artifact_dir }}
+          if-no-files-found: error

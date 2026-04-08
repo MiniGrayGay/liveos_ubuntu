@@ -17,7 +17,8 @@ usage() {
 Usage: script/make_bootable_iso [kernel_path] [initramfs_path]
 
 Default behavior:
-  - load the highest-version non-mod kernel from output/bzImage_*
+  - load the highest-version non-mod kernel from output/<version>/bzImage
+    or legacy output/bzImage_*
   - load the newest initramfs from output/initrd-*.zst
   - copy them into grub4dos/iso as /bzImage and /initrd.zst
   - build the ISO directly from grub4dos/iso via xorrisofs
@@ -42,17 +43,30 @@ require_file() {
 }
 
 find_latest_standard_kernel() {
-  local version
+  local candidate_path
+  local legacy_version
 
-  version="$(
+  candidate_path="$(
+    find "$OUTPUT_DIR" -mindepth 2 -maxdepth 2 -type f -path '*/bzImage' -printf '%P\n' 2>/dev/null \
+      | sed -n '/-mod\/bzImage$/d; p' \
+      | sort -V \
+      | tail -n 1
+  )"
+
+  if [ -n "$candidate_path" ]; then
+    printf '%s\n' "$OUTPUT_DIR/$candidate_path"
+    return 0
+  fi
+
+  legacy_version="$(
     find "$OUTPUT_DIR" -maxdepth 1 -type f -name 'bzImage_*' -printf '%f\n' 2>/dev/null \
       | sed -n '/-mod$/d; s/^bzImage_//p' \
       | sort -V \
       | tail -n 1
   )"
 
-  [ -n "$version" ] || return 1
-  printf '%s\n' "$OUTPUT_DIR/bzImage_$version"
+  [ -n "$legacy_version" ] || return 1
+  printf '%s\n' "$OUTPUT_DIR/bzImage_$legacy_version"
 }
 
 find_latest_initrd() {
