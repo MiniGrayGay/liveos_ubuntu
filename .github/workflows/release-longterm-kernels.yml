@@ -1,0 +1,224 @@
+name: Release Longterm Kernels
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release-longterm-kernels
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve longterm versions
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      versions_json: ${{ steps.resolve.outputs.versions_json }}
+      timestamp: ${{ steps.resolve.outputs.timestamp }}
+    steps:
+      - name: Install resolver dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            jq
+
+      - name: Read active longterm versions
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          versions_json="$(
+            curl -fsSL --retry 3 --retry-delay 2 https://www.kernel.org/releases.json \
+              | jq -c '
+                  [
+                    .releases[]
+                    | select(.moniker == "longterm" and (.iseol | not))
+                    | .version
+                  ]
+                  | reduce .[] as $version ([]; if index($version) then . else . + [$version] end)
+                '
+          )"
+
+          version_count="$(jq 'length' <<<"$versions_json")"
+          if [[ "$version_count" -eq 0 ]]; then
+            echo "error: no active longterm kernel versions found in kernel.org releases.json" >&2
+            exit 1
+          fi
+
+          timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+
+          {
+            echo "versions_json=$versions_json"
+            echo "timestamp=$timestamp"
+          } >>"$GITHUB_OUTPUT"
+
+          echo "Resolved active longterm kernel versions:"
+          jq -r '.[]' <<<"$versions_json"
+          echo "Release timestamp: $timestamp"
+
+  build:
+    name: Build ${{ matrix.version }}
+    needs: resolve
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.resolve.outputs.versions_json) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            bzip2 \
+            ca-certificates \
+            cpio \
+            curl \
+            dwarves \
+            file \
+            flex \
+            kmod \
+            libelf-dev \
+            libssl-dev \
+            linux-libc-dev \
+            python3 \
+            xz-utils \
+            zstd
+
+      - name: Build standard and modular kernels
+        shell: bash
+        env:
+          KERNEL_VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          ./script/compile_kernel_outputs.sh "$KERNEL_VERSION"
+
+      - name: Package release assets
+        id: package
+        shell: bash
+        env:
+          KERNEL_VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+
+          artifact_dir="$RUNNER_TEMP/release-assets"
+          staging_dir="$RUNNER_TEMP/release-staging"
+          standard_dir="output/${KERNEL_VERSION}"
+          modular_dir="output/${KERNEL_VERSION}-mod"
+          kernel_series="${KERNEL_VERSION%.*}"
+
+          standard_staging_dir="$staging_dir/standard"
+          modular_staging_dir="$staging_dir/modular"
+
+          mkdir -p "$artifact_dir" "$standard_staging_dir" "$modular_staging_dir"
+
+          for required in \
+            "$standard_dir/bzImage" \
+            "$modular_dir/bzImage"; do
+            if [[ ! -f "$required" ]]; then
+              echo "error: expected build output missing: $required" >&2
+              exit 1
+            fi
+          done
+
+          cp "$standard_dir/bzImage" "$standard_staging_dir/bzImage"
+          cp "$modular_dir/bzImage" "$modular_staging_dir/bzImage"
+
+          tar -C "$standard_staging_dir" -cf \
+            "$artifact_dir/bzImage-${kernel_series}.tar" \
+            bzImage
+
+          tar -C "$modular_staging_dir" -cf \
+            "$artifact_dir/bzImage-${kernel_series}-mod.tar" \
+            bzImage
+
+          {
+            echo "artifact_dir=$artifact_dir"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: longterm-kernel-${{ matrix.version }}
+          path: ${{ steps.package.outputs.artifact_dir }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - resolve
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: longterm-kernel-*
+          merge-multiple: false
+
+      - name: Create release notes
+        shell: bash
+        env:
+          RELEASE_TIME: ${{ needs.resolve.outputs.timestamp }}
+          VERSIONS_JSON: ${{ needs.resolve.outputs.versions_json }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' >release-notes.md
+          import json
+          import os
+
+          release_time = os.environ["RELEASE_TIME"]
+          versions = json.loads(os.environ["VERSIONS_JSON"])
+
+          print(f"Linux longterm kernel builds generated at {release_time}.")
+          print()
+          print("Versions:")
+          for version in versions:
+              series = ".".join(version.split(".")[:2])
+              print(f"- {version}: bzImage-{series}.tar and bzImage-{series}-mod.tar")
+          PY
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TIME: ${{ needs.resolve.outputs.timestamp }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t release_files < <(
+            find release-assets -type f \
+              -name '*.tar' \
+              | sort
+          )
+
+          if [[ "${#release_files[@]}" -eq 0 ]]; then
+            echo "error: no release files found" >&2
+            exit 1
+          fi
+
+          gh release create "$RELEASE_TIME" "${release_files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TIME" \
+            --notes-file release-notes.md

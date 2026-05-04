@@ -1,0 +1,205 @@
+name: Build Initrd
+
+on:
+  workflow_dispatch:
+    inputs:
+      ubuntu_base_release_url:
+        description: Ubuntu base release directory
+        required: true
+        type: string
+        default: https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/
+      ubuntu_arch:
+        description: Ubuntu base architecture
+        required: true
+        type: string
+        default: amd64
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            bzip2 \
+            ca-certificates \
+            cpio \
+            curl \
+            file \
+            make \
+            musl-tools \
+            python3 \
+            xz-utils \
+            zstd
+
+      - name: Resolve Ubuntu base tarball
+        id: ubuntu_base
+        shell: bash
+        env:
+          UBUNTU_BASE_RELEASE_URL: ${{ inputs.ubuntu_base_release_url }}
+          UBUNTU_ARCH: ${{ inputs.ubuntu_arch }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' >"$RUNNER_TEMP/ubuntu-base.env"
+          import html.parser
+          import os
+          import re
+          import sys
+          import urllib.parse
+          import urllib.request
+
+          release_url = os.environ["UBUNTU_BASE_RELEASE_URL"].rstrip("/") + "/"
+          arch = os.environ["UBUNTU_ARCH"]
+
+          if not re.fullmatch(r"[A-Za-z0-9_.-]+", arch):
+              print(f"error: invalid Ubuntu architecture: {arch}", file=sys.stderr)
+              sys.exit(1)
+
+          class LinkParser(html.parser.HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.hrefs = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag != "a":
+                      return
+                  for key, value in attrs:
+                      if key == "href" and value:
+                          self.hrefs.append(value)
+
+          with urllib.request.urlopen(release_url, timeout=60) as response:
+              page = response.read().decode("utf-8", "replace")
+
+          parser = LinkParser()
+          parser.feed(page)
+
+          pattern = re.compile(
+              rf"^(ubuntu-base-(\d+\.\d+(?:\.\d+)?)-base-{re.escape(arch)}\.tar\.(?:gz|xz|zst))$"
+          )
+          candidates = []
+          for href in parser.hrefs:
+              name = urllib.parse.unquote(href.rsplit("/", 1)[-1])
+              match = pattern.fullmatch(name)
+              if not match:
+                  continue
+              version_key = tuple(int(part) for part in match.group(2).split("."))
+              candidates.append((version_key, name))
+
+          if not candidates:
+              print(
+                  f"error: no ubuntu-base tarball for architecture {arch} found at {release_url}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          _, tarball_name = max(candidates)
+          tarball_url = urllib.parse.urljoin(release_url, tarball_name)
+
+          print(f"tarball_name={tarball_name}")
+          print(f"tarball_url={tarball_url}")
+          PY
+
+          cat "$RUNNER_TEMP/ubuntu-base.env" >>"$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/ubuntu-base.env"
+
+      - name: Download Ubuntu base
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "${{ steps.ubuntu_base.outputs.tarball_name }}" \
+            "${{ steps.ubuntu_base.outputs.tarball_url }}"
+          ls -lh "${{ steps.ubuntu_base.outputs.tarball_name }}"
+
+      - name: Build static userspace tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./script/build_static_busybox.sh
+          ./script/build_static_dropbearmulti.sh
+          ./script/build_static_sftp_server.sh
+
+      - name: Build initrd sysroot
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo ./script/setup_sysroot.sh -y
+
+          if grep -R -n '@UBUNTU_CODENAME@\|Ubuntu 26.04' sysroot/etc/issue sysroot/mirror.sh; then
+            echo "error: stale Ubuntu version placeholder found in generated sysroot files" >&2
+            exit 1
+          fi
+
+          echo "Generated login issue:"
+          sed -n '1,8p' sysroot/etc/issue
+
+          echo "Generated mirror suites:"
+          grep -n '^Suites:' sysroot/mirror.sh
+
+      - name: Export initrd
+        id: export_initrd
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo ./script/export_sysroot.sh
+
+          initrd_path="$(
+            find output -maxdepth 1 -type f -name 'initrd-*.zst' -printf '%T@ %p\n' \
+              | sort -n \
+              | tail -n 1 \
+              | cut -d' ' -f2-
+          )"
+          [[ -n "$initrd_path" ]] || {
+            echo "error: no initrd artifact found under output/" >&2
+            exit 1
+          }
+
+          {
+            echo "initrd_path=$initrd_path"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Package initrd artifact
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          artifact_dir="$RUNNER_TEMP/initrd-artifact"
+          mkdir -p "$artifact_dir"
+
+          cp "${{ steps.export_initrd.outputs.initrd_path }}" "$artifact_dir/"
+
+          {
+            echo "ubuntu_base_release_url=${{ inputs.ubuntu_base_release_url }}"
+            echo "ubuntu_base_tarball=${{ steps.ubuntu_base.outputs.tarball_name }}"
+            echo "ubuntu_base_url=${{ steps.ubuntu_base.outputs.tarball_url }}"
+            echo "initrd_path=${{ steps.export_initrd.outputs.initrd_path }}"
+            echo
+            echo "issue:"
+            sed 's/^/  /' sysroot/etc/issue
+            echo
+            echo "mirror_suites:"
+            grep '^Suites:' sysroot/mirror.sh | sed 's/^/  /'
+          } >"$artifact_dir/metadata.txt"
+
+          {
+            echo "artifact_dir=$artifact_dir"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload initrd artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: initrd-${{ steps.ubuntu_base.outputs.tarball_name }}
+          path: ${{ steps.package.outputs.artifact_dir }}
+          if-no-files-found: error

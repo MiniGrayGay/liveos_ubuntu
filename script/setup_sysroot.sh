@@ -152,6 +152,24 @@ find_latest_ubuntu_base() {
   printf '%s\n' "$latest"
 }
 
+read_os_release_value() {
+  local key=$1
+  local file="$SYSROOT_DIR/etc/os-release"
+
+  [ -r "$file" ] || return 1
+  awk -F= -v key="$key" '
+    $1 == key {
+      value = substr($0, length(key) + 2)
+      if (value ~ /^"/) {
+        sub(/^"/, "", value)
+        sub(/"$/, "", value)
+      }
+      print value
+      exit
+    }
+  ' "$file"
+}
+
 extract_ubuntu_base() {
   local tarball=$1
 
@@ -220,6 +238,16 @@ shift $((OPTIND - 1))
 
 prepare_base_sysroot
 
+UBUNTU_PRETTY_NAME="$(read_os_release_value PRETTY_NAME || true)"
+UBUNTU_VERSION_ID="$(read_os_release_value VERSION_ID || true)"
+UBUNTU_CODENAME="$(read_os_release_value VERSION_CODENAME || true)"
+if [ -z "$UBUNTU_CODENAME" ]; then
+  UBUNTU_CODENAME="$(read_os_release_value UBUNTU_CODENAME || true)"
+fi
+
+[ -n "$UBUNTU_PRETTY_NAME" ] || UBUNTU_PRETTY_NAME="Ubuntu ${UBUNTU_VERSION_ID:-unknown}"
+[ -n "$UBUNTU_CODENAME" ] || die "could not detect Ubuntu codename from $SYSROOT_DIR/etc/os-release"
+
 mkdir -p "$ETC_DIR"
 mkdir -p "$ETC_DIR/dropbear"
 chmod 700 "$ETC_DIR/dropbear"
@@ -248,7 +276,7 @@ EOF
 : >"$ETC_DIR/legal"
 
 cat >"$ETC_DIR/issue" <<EOF
-Ubuntu 24.04.4 LTS \n \l
+${UBUNTU_PRETTY_NAME} \n \l
 
 Accounts:
   root / ${ROOT_PASSWORD}
@@ -279,13 +307,13 @@ case "$1" in
     cat >"$SOURCES_FILE" <<'EOCN'
 Types: deb
 URIs: http://mirrors4.tuna.tsinghua.edu.cn/ubuntu
-Suites: noble noble-updates noble-backports
+Suites: @UBUNTU_CODENAME@ @UBUNTU_CODENAME@-updates @UBUNTU_CODENAME@-backports
 Components: main universe restricted multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 
 Types: deb
 URIs: http://mirrors4.tuna.tsinghua.edu.cn/ubuntu
-Suites: noble-security
+Suites: @UBUNTU_CODENAME@-security
 Components: main universe restricted multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOCN
@@ -298,13 +326,13 @@ EODNS
     cat >"$SOURCES_FILE" <<'EOOS'
 Types: deb
 URIs: http://archive.ubuntu.com/ubuntu/
-Suites: noble noble-updates noble-backports
+Suites: @UBUNTU_CODENAME@ @UBUNTU_CODENAME@-updates @UBUNTU_CODENAME@-backports
 Components: main universe restricted multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 
 Types: deb
 URIs: http://security.ubuntu.com/ubuntu/
-Suites: noble-security
+Suites: @UBUNTU_CODENAME@-security
 Components: main universe restricted multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOOS
@@ -321,6 +349,7 @@ esac
 echo "Updated $SOURCES_FILE with mode: $1"
 EOF
 
+sed -i "s/@UBUNTU_CODENAME@/${UBUNTU_CODENAME}/g" "$SYSROOT_DIR/mirror.sh"
 chmod 755 "$SYSROOT_DIR/mirror.sh"
 install -Dm755 "$ROOT_DIR/script/init" "$SYSROOT_DIR/init"
 install -Dm755 "$ROOT_DIR/script/udhcpc.default.script" "$SYSROOT_DIR/usr/share/udhcpc/default.script"

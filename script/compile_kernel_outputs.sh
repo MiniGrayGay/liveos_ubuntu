@@ -4,94 +4,51 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 KERNEL_DIR="$ROOT_DIR/kernel"
 OUTPUT_DIR="$ROOT_DIR/output"
+SOURCE_CACHE_DIR="$ROOT_DIR/tmp/kernel-source-cache"
 JOBS=${JOBS:-$(nproc)}
 TMP_WORK_ROOT=""
 
-declare -a SOURCES=(
-  "5.10|linux-5.10.252"
-  "5.15|linux-5.15.202"
-  "6.1|linux-6.1.167"
-  "6.6|linux-6.6.133"
-  "6.12|linux-6.12.80"
-  "6.18|linux-6.18.21"
-)
+# shellcheck source=/root/kernel/script/kernel_source_matrix.sh
+source "$ROOT_DIR/script/kernel_source_matrix.sh"
 
 usage() {
   cat <<'EOF'
-Usage: compile_kernel_outputs.sh [--mod|--std|--both] [version|version-mod|/path/to/linux-source ...]
+Usage: compile_kernel_outputs.sh [--mod|--std|--both] [version|version-mod|x.y.z|/path/to/linux-source ...]
 
 Without arguments:
-  Build all configured versions in both standard and modular flavors.
+  Build all configured series in both standard and modular flavors using the
+  canonical patch versions from kernel.org, downloading them when needed.
 
 With arguments:
   --mod           Build only the modular flavor for following inputs
   --std           Build only the standard flavor for following inputs
   --both          Build both flavors for following inputs (default)
-  5.10           Build standard and modular outputs for 5.10
-  6.18           Build standard and modular outputs for 6.18
-  6.18-mod       Build only the modular output for 6.18
-  6.18-modular   Build only the modular output for 6.18
-  /path/linux-6.18.21
-                 Detect source version from the path name, prefer the same
-                 config series, otherwise use the nearest lower config series
-                 and run olddefconfig
+  5.10            Build standard and modular outputs for series 5.10 using
+                  linux-5.10.252
+  6.18-mod        Build only the modular output for series 6.18 using
+                  linux-6.18.22
+  6.18.22         Build standard and modular outputs for linux-6.18.22
+  /path/linux-6.18.22
+                  Use the provided source tree and the nearest matching config
+                  series, running olddefconfig before the build
   /tmp/linux-6.19.11.tar.xz
-                 Extract the archive, detect 6.19.11 from the file name, then
-                 fall back to the nearest lower config series such as 6.18
+                  Extract the archive, detect 6.19.11 from the file name, then
+                  fall back to the nearest lower config series such as 6.18
 
 Examples:
   ./script/compile_kernel_outputs.sh 6.18
   ./script/compile_kernel_outputs.sh 6.18-mod
-  ./script/compile_kernel_outputs.sh --mod /tmp/linux-6.19.11.tar.xz
-  ./script/compile_kernel_outputs.sh 5.10 6.18
-  ./script/compile_kernel_outputs.sh /work/linux-6.18.21
+  ./script/compile_kernel_outputs.sh 6.18.22
+  ./script/compile_kernel_outputs.sh --mod 6.18.22
   ./script/compile_kernel_outputs.sh /tmp/linux-6.19.11.tar.xz
 EOF
 }
 
-find_source_name() {
-  local wanted=$1
-  local short_ver
-  local source_name
-
-  for entry in "${SOURCES[@]}"; do
-    IFS='|' read -r short_ver source_name <<<"$entry"
-    if [[ "$short_ver" == "$wanted" ]]; then
-      printf '%s\n' "$source_name"
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-version_sort_key() {
-  local version=$1
-  local major minor patch
-
-  IFS='.' read -r major minor patch <<<"$version"
-  patch=${patch:-0}
-  printf '%05d%05d%05d\n' "$major" "$minor" "$patch"
-}
-
-detect_version_from_name() {
-  local name=$1
-  local base=${name##*/}
-
-  base=${base%.tar.gz}
-  base=${base%.tar.xz}
-  base=${base%.tar.zst}
-  base=${base%.tar.bz2}
-  base=${base%.tgz}
-  base=${base%.txz}
-  base=${base%.tbz2}
-
-  if [[ "$base" =~ ([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then
-    printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]:-0}"
-    return 0
-  fi
-
-  return 1
+require_tool() {
+  command -v "$1" >/dev/null 2>&1 || {
+    printf 'error: missing required tool: %s\n' "$1" >&2
+    exit 1
+  }
 }
 
 ensure_tmp_work_root() {
@@ -153,37 +110,75 @@ resolve_source_tree() {
   return 1
 }
 
-find_best_config_series() {
-  local detected_version=$1
-  local short_series=${detected_version%.*}
-  local detected_key best_series="" best_key=""
-  local entry source_name candidate_key
-  local candidate_series
+find_local_source_tree_by_name() {
+  local source_name=$1
+  local candidate
 
-  detected_key=$(version_sort_key "$detected_version")
-
-  for entry in "${SOURCES[@]}"; do
-    IFS='|' read -r candidate_series source_name <<<"$entry"
-    if [[ "$candidate_series" == "$short_series" ]]; then
-      printf '%s\n' "$candidate_series"
+  for candidate in \
+    "$KERNEL_DIR/$source_name" \
+    "$ROOT_DIR/tmp/kernel-source-trees/$source_name"; do
+    if [[ -d "$candidate" ]]; then
+      printf '%s\n' "$candidate"
       return 0
     fi
   done
 
-  for entry in "${SOURCES[@]}"; do
-    IFS='|' read -r candidate_series source_name <<<"$entry"
-    candidate_key=$(version_sort_key "$candidate_series")
-    if [[ "$candidate_key" > "$detected_key" ]]; then
-      continue
-    fi
-    if [[ -z "$best_key" || "$candidate_key" > "$best_key" ]]; then
-      best_key=$candidate_key
-      best_series=$candidate_series
-    fi
-  done
+  return 1
+}
 
-  [[ -n "$best_series" ]] || return 1
-  printf '%s\n' "$best_series"
+fetch_source_archive() {
+  local version=$1
+  local archive_name archive_path archive_url
+
+  archive_name=$(kernel_tarball_name_for_version "$version")
+  archive_path="$SOURCE_CACHE_DIR/$archive_name"
+  archive_url=$(kernel_tarball_url_for_version "$version")
+
+  mkdir -p "$SOURCE_CACHE_DIR"
+
+  if [[ ! -f "$archive_path" ]]; then
+    printf '==> Downloading %s\n' "$archive_url" >&2
+    curl -fL --retry 3 --retry-delay 2 -o "$archive_path" "$archive_url"
+  fi
+
+  printf '%s\n' "$archive_path"
+}
+
+ensure_source_tree_for_series() {
+  local series=$1
+  local source_name full_version archive_path
+
+  source_name=$(kernel_source_name_for_series "$series") || {
+    printf 'error: unknown kernel series: %s\n' "$series" >&2
+    exit 1
+  }
+
+  if find_local_source_tree_by_name "$source_name" >/dev/null; then
+    find_local_source_tree_by_name "$source_name"
+    return 0
+  fi
+
+  full_version=$(kernel_full_version_for_series "$series") || {
+    printf 'error: missing canonical version for series: %s\n' "$series" >&2
+    exit 1
+  }
+  archive_path=$(fetch_source_archive "$full_version")
+  resolve_source_tree "$archive_path"
+}
+
+ensure_source_tree_for_exact_version() {
+  local version=$1
+  local source_name archive_path
+
+  source_name="linux-$version"
+
+  if find_local_source_tree_by_name "$source_name" >/dev/null; then
+    find_local_source_tree_by_name "$source_name"
+    return 0
+  fi
+
+  archive_path=$(fetch_source_archive "$version")
+  resolve_source_tree "$archive_path"
 }
 
 build_one() {
@@ -191,12 +186,18 @@ build_one() {
   local config_ver=$2
   local source_dir=$3
   local flavor=$4
+  local source_series=$display_ver
 
   local config_suffix=""
   local output_name="$display_ver"
+  local modules_enabled=0
   if [[ "$flavor" == "modular" ]]; then
     config_suffix="-modular"
     output_name="${display_ver}-mod"
+  fi
+
+  if [[ "$display_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    source_series=${display_ver%.*}
   fi
 
   local config_path="$KERNEL_DIR/linux-${config_ver}${config_suffix}.config"
@@ -221,6 +222,7 @@ build_one() {
 
   make -C "$source_dir" O="$build_dir" olddefconfig
   if grep -q '^CONFIG_MODULES=y' "$build_dir/.config"; then
+    modules_enabled=1
     make -C "$source_dir" O="$build_dir" -j"$JOBS" bzImage modules
   else
     make -C "$source_dir" O="$build_dir" -j"$JOBS" bzImage
@@ -229,41 +231,81 @@ build_one() {
   local kernelrelease
   kernelrelease=$(make -s -C "$source_dir" O="$build_dir" kernelrelease)
 
+  if [[ "$modules_enabled" -eq 1 ]]; then
+    make -C "$source_dir" O="$build_dir" INSTALL_MOD_PATH="$target_dir" modules_install
+    depmod -b "$target_dir" -F "$build_dir/System.map" "$kernelrelease"
+  fi
+
   cp "$image_path" "$target_dir/bzImage"
   cp "$build_dir/vmlinux" "$target_dir/vmlinux"
   cp "$build_dir/System.map" "$target_dir/System.map"
   cp "$build_dir/.config" "$target_dir/config"
 
-  cat >"$target_dir/build-info.txt" <<EOF
-display_version=$output_name
-source_tree=$source_dir
-source_series=$display_ver
-config_series=$config_ver
-config=$config_path
-kernelrelease=$kernelrelease
-jobs=$JOBS
-EOF
+  {
+    printf 'display_version=%s\n' "$output_name"
+    printf 'source_tree=%s\n' "$source_dir"
+    printf 'source_version=%s\n' "$(kernel_detect_version_from_name "$source_dir" || true)"
+    printf 'source_series=%s\n' "$source_series"
+    printf 'config_series=%s\n' "$config_ver"
+    printf 'config=%s\n' "$config_path"
+    printf 'kernelrelease=%s\n' "$kernelrelease"
+    printf 'jobs=%s\n' "$JOBS"
+    printf 'modules_enabled=%s\n' "$modules_enabled"
+    if [[ "$modules_enabled" -eq 1 ]]; then
+      printf 'modules_dir=%s\n' "$target_dir/lib/modules/$kernelrelease"
+    fi
+  } >"$target_dir/build-info.txt"
+}
+
+build_from_detected_version() {
+  local detected_version=$1
+  local source_dir=$2
+  local mode=$3
+  local config_ver
+
+  config_ver=$(kernel_find_best_series_for_version "$detected_version") || {
+    printf 'error: no usable config series found for source version %s\n' "$detected_version" >&2
+    exit 1
+  }
+
+  case "$mode" in
+    standard)
+      build_one "$detected_version" "$config_ver" "$source_dir" standard
+      ;;
+    modular)
+      build_one "$detected_version" "$config_ver" "$source_dir" modular
+      ;;
+    both)
+      build_one "$detected_version" "$config_ver" "$source_dir" standard
+      build_one "$detected_version" "$config_ver" "$source_dir" modular
+      ;;
+  esac
 }
 
 main() {
   trap cleanup EXIT
   mkdir -p "$OUTPUT_DIR"
 
-  local short_ver
-  local source_name
+  require_tool curl
+  require_tool depmod
+  require_tool find
+  require_tool make
+  require_tool sort
+  require_tool tar
+
   local request
   local flavor
   local base_ver
   local source_dir
   local detected_version
-  local config_ver
   local mode=both
+  local short_ver
 
   if [[ "$#" -eq 0 ]]; then
-    for entry in "${SOURCES[@]}"; do
-      IFS='|' read -r short_ver source_name <<<"$entry"
-      build_one "$short_ver" "$short_ver" "$KERNEL_DIR/$source_name" standard
-      build_one "$short_ver" "$short_ver" "$KERNEL_DIR/$source_name" modular
+    for short_ver in "${KERNEL_SERIES[@]}"; do
+      source_dir=$(ensure_source_tree_for_series "$short_ver")
+      build_one "$short_ver" "$short_ver" "$source_dir" standard
+      build_one "$short_ver" "$short_ver" "$source_dir" modular
     done
     return
   fi
@@ -282,10 +324,14 @@ main() {
         mode=both
         continue
         ;;
+      -h|--help)
+        usage
+        return
+        ;;
     esac
 
     if [[ -e "$request" ]]; then
-      detected_version=$(detect_version_from_name "$request") || {
+      detected_version=$(kernel_detect_version_from_name "$request") || {
         printf 'error: could not detect kernel version from path name: %s\n' "$request" >&2
         exit 1
       }
@@ -293,30 +339,11 @@ main() {
         printf 'error: could not resolve a kernel source tree from: %s\n' "$request" >&2
         exit 1
       }
-      config_ver=$(find_best_config_series "$detected_version") || {
-        printf 'error: no usable config series found for source version %s\n' "$detected_version" >&2
-        exit 1
-      }
-      case "$mode" in
-        standard)
-          build_one "$detected_version" "$config_ver" "$source_dir" standard
-          ;;
-        modular)
-          build_one "$detected_version" "$config_ver" "$source_dir" modular
-          ;;
-        both)
-          build_one "$detected_version" "$config_ver" "$source_dir" standard
-          build_one "$detected_version" "$config_ver" "$source_dir" modular
-          ;;
-      esac
+      build_from_detected_version "$detected_version" "$source_dir" "$mode"
       continue
     fi
 
     case "$request" in
-      -h|--help)
-        usage
-        return
-        ;;
       *-mod|*-modular)
         flavor=modular
         base_ver=${request%-modular}
@@ -328,21 +355,36 @@ main() {
         ;;
     esac
 
-    source_name=$(find_source_name "$base_ver") || {
+    if [[ "$base_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      source_dir=$(ensure_source_tree_for_exact_version "$base_ver")
+      if [[ "$flavor" == "modular" ]]; then
+        build_from_detected_version "$base_ver" "$source_dir" modular
+      elif [[ "$mode" == "standard" ]]; then
+        build_from_detected_version "$base_ver" "$source_dir" standard
+      elif [[ "$mode" == "modular" ]]; then
+        build_from_detected_version "$base_ver" "$source_dir" modular
+      else
+        build_from_detected_version "$base_ver" "$source_dir" both
+      fi
+      continue
+    fi
+
+    kernel_source_name_for_series "$base_ver" >/dev/null || {
       printf 'error: unknown kernel version: %s\n' "$request" >&2
       usage >&2
       exit 1
     }
+    source_dir=$(ensure_source_tree_for_series "$base_ver")
 
     if [[ "$flavor" == "modular" ]]; then
-      build_one "$base_ver" "$base_ver" "$KERNEL_DIR/$source_name" modular
+      build_one "$base_ver" "$base_ver" "$source_dir" modular
     elif [[ "$mode" == "standard" ]]; then
-      build_one "$base_ver" "$base_ver" "$KERNEL_DIR/$source_name" standard
+      build_one "$base_ver" "$base_ver" "$source_dir" standard
     elif [[ "$mode" == "modular" ]]; then
-      build_one "$base_ver" "$base_ver" "$KERNEL_DIR/$source_name" modular
+      build_one "$base_ver" "$base_ver" "$source_dir" modular
     else
-      build_one "$base_ver" "$base_ver" "$KERNEL_DIR/$source_name" standard
-      build_one "$base_ver" "$base_ver" "$KERNEL_DIR/$source_name" modular
+      build_one "$base_ver" "$base_ver" "$source_dir" standard
+      build_one "$base_ver" "$base_ver" "$source_dir" modular
     fi
   done
 }

@@ -2,11 +2,16 @@
 /sysroot/*
 !/sysroot/.gitkeep
 
+/tmp/*
+!/tmp/.gitkeep
+
 /output/*
 !/output/.gitkeep
 
 /build/*
 !/build/.gitkeep
+
+/archlinux/
 
 # Editor and OS temporary files
 /.vscode/

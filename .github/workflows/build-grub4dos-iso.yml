@@ -1,0 +1,362 @@
+name: Build Grub4dos ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel:
+        description: Kernel version such as 6.18.24, kernel source URL, bzImage tar URL, or bzImage URL
+        required: true
+        type: string
+        default: 6.18.24
+      ubuntu_base:
+        description: Ubuntu base version such as 24.04, release directory URL, or tarball URL
+        required: true
+        type: string
+        default: 24.04
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            bzip2 \
+            ca-certificates \
+            cpio \
+            curl \
+            dwarves \
+            file \
+            flex \
+            kmod \
+            libelf-dev \
+            libssl-dev \
+            linux-libc-dev \
+            make \
+            musl-tools \
+            python3 \
+            xorriso \
+            xz-utils \
+            zstd
+
+      - name: Resolve Ubuntu base input
+        id: ubuntu_base
+        shell: bash
+        env:
+          UBUNTU_BASE_INPUT: ${{ inputs.ubuntu_base }}
+          UBUNTU_ARCH: amd64
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY' >"$RUNNER_TEMP/ubuntu-base.env"
+          import html.parser
+          import os
+          import re
+          import sys
+          import urllib.parse
+          import urllib.request
+
+          ubuntu_base = os.environ["UBUNTU_BASE_INPUT"].strip()
+          arch = os.environ["UBUNTU_ARCH"]
+
+          if not ubuntu_base:
+              print("error: ubuntu_base input is empty", file=sys.stderr)
+              sys.exit(1)
+
+          tarball_pattern = re.compile(
+              rf"^ubuntu-base-\d+\.\d+(?:\.\d+)?-base-{re.escape(arch)}\.tar\.(?:gz|xz|zst)$"
+          )
+
+          if re.fullmatch(r"\d+\.\d+", ubuntu_base):
+              release_url = f"https://cdimage.ubuntu.com/ubuntu-base/releases/{ubuntu_base}/release/"
+          elif re.match(r"^https?://", ubuntu_base):
+              parsed = urllib.parse.urlparse(ubuntu_base)
+              name = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
+              if tarball_pattern.fullmatch(name):
+                  print(f"tarball_name={name}")
+                  print(f"tarball_url={ubuntu_base}")
+                  print(f"release_url={urllib.parse.urljoin(ubuntu_base, './')}")
+                  sys.exit(0)
+              release_url = ubuntu_base.rstrip("/") + "/"
+          else:
+              print(
+                  "error: ubuntu_base must be a version like 24.04, a release directory URL, or an ubuntu-base tarball URL",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          class LinkParser(html.parser.HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.hrefs = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag != "a":
+                      return
+                  for key, value in attrs:
+                      if key == "href" and value:
+                          self.hrefs.append(value)
+
+          with urllib.request.urlopen(release_url, timeout=60) as response:
+              page = response.read().decode("utf-8", "replace")
+
+          parser = LinkParser()
+          parser.feed(page)
+
+          candidates = []
+          version_pattern = re.compile(
+              rf"^(ubuntu-base-(\d+\.\d+(?:\.\d+)?)-base-{re.escape(arch)}\.tar\.(?:gz|xz|zst))$"
+          )
+          for href in parser.hrefs:
+              name = urllib.parse.unquote(href.rsplit("/", 1)[-1])
+              match = version_pattern.fullmatch(name)
+              if not match:
+                  continue
+              version_key = tuple(int(part) for part in match.group(2).split("."))
+              candidates.append((version_key, name))
+
+          if not candidates:
+              print(
+                  f"error: no ubuntu-base tarball for architecture {arch} found at {release_url}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          _, tarball_name = max(candidates)
+          print(f"tarball_name={tarball_name}")
+          print(f"tarball_url={urllib.parse.urljoin(release_url, tarball_name)}")
+          print(f"release_url={release_url}")
+          PY
+
+          cat "$RUNNER_TEMP/ubuntu-base.env" >>"$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/ubuntu-base.env"
+
+      - name: Download Ubuntu base
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "${{ steps.ubuntu_base.outputs.tarball_name }}" \
+            "${{ steps.ubuntu_base.outputs.tarball_url }}"
+          ls -lh "${{ steps.ubuntu_base.outputs.tarball_name }}"
+
+      - name: Resolve kernel input
+        id: kernel
+        shell: bash
+        env:
+          KERNEL_INPUT: ${{ inputs.kernel }}
+        run: |
+          set -euo pipefail
+
+          kernel_input="${KERNEL_INPUT}"
+          mkdir -p "$RUNNER_TEMP/kernel-input"
+
+          if [[ "$kernel_input" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            {
+              echo "kind=version"
+              echo "version=$kernel_input"
+            } >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ ! "$kernel_input" =~ ^https?:// ]]; then
+            echo "error: kernel must be a version like 6.18.24 or an http(s) URL" >&2
+            exit 1
+          fi
+
+          url_path="${kernel_input%%\#*}"
+          url_path="${url_path%%\?*}"
+          file_name="${url_path##*/}"
+          if [[ -z "$file_name" || "$file_name" == */ ]]; then
+            echo "error: kernel URL must point to a file" >&2
+            exit 1
+          fi
+
+          input_path="$RUNNER_TEMP/kernel-input/$file_name"
+          curl -fL --retry 3 --retry-delay 2 -o "$input_path" "$kernel_input"
+          ls -lh "$input_path"
+
+          if [[ "$file_name" =~ ^linux-[0-9]+\.[0-9]+(\.[0-9]+)?.*\.tar\.(gz|xz|zst|bz2)$ || "$file_name" =~ ^linux-[0-9]+\.[0-9]+(\.[0-9]+)?\.t(gz|xz|z|bz2)$ ]]; then
+            {
+              echo "kind=source_archive"
+              echo "path=$input_path"
+            } >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$file_name" =~ ^bzImage.*\.tar$ ]]; then
+            extract_dir="$RUNNER_TEMP/kernel-input/extracted"
+            mkdir -p "$extract_dir"
+            tar -xf "$input_path" -C "$extract_dir"
+            bzimage_path="$(
+              find "$extract_dir" -type f -name bzImage -print -quit
+            )"
+            [[ -n "$bzimage_path" ]] || {
+              echo "error: tar archive does not contain a bzImage file: $input_path" >&2
+              exit 1
+            }
+            {
+              echo "kind=bzimage"
+              echo "path=$bzimage_path"
+            } >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$file_name" == bzImage* ]]; then
+            {
+              echo "kind=bzimage"
+              echo "path=$input_path"
+            } >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "error: unsupported kernel URL. Expected a Linux source tarball, bzImage tar, or bzImage file." >&2
+          exit 1
+
+      - name: Build or stage kernel
+        id: kernel_output
+        shell: bash
+        env:
+          KERNEL_KIND: ${{ steps.kernel.outputs.kind }}
+          KERNEL_VERSION: ${{ steps.kernel.outputs.version }}
+          KERNEL_PATH: ${{ steps.kernel.outputs.path }}
+        run: |
+          set -euo pipefail
+
+          case "$KERNEL_KIND" in
+            version)
+              ./script/compile_kernel_outputs.sh --std "$KERNEL_VERSION"
+              kernel_path="output/${KERNEL_VERSION}/bzImage"
+              ;;
+            source_archive)
+              ./script/compile_kernel_outputs.sh --std "$KERNEL_PATH"
+              detected_version="$(
+                SOURCE_NAME="$(basename "$KERNEL_PATH")" python3 -c 'import os, re; name = os.environ["SOURCE_NAME"]; match = re.search(r"([0-9]+\.[0-9]+(?:\.[0-9]+)?)", name); assert match is not None; version = match.group(1); print(version if version.count(".") == 2 else version + ".0")'
+              )"
+              kernel_path="output/${detected_version}/bzImage"
+              ;;
+            bzimage)
+              kernel_path="$KERNEL_PATH"
+              ;;
+            *)
+              echo "error: unsupported kernel kind: $KERNEL_KIND" >&2
+              exit 1
+              ;;
+          esac
+
+          [[ -f "$kernel_path" ]] || {
+            echo "error: kernel image not found: $kernel_path" >&2
+            exit 1
+          }
+
+          {
+            echo "kernel_path=$kernel_path"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Build static userspace tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./script/build_static_busybox.sh
+          ./script/build_static_dropbearmulti.sh
+          ./script/build_static_sftp_server.sh
+
+      - name: Build initrd
+        id: initrd
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo ./script/setup_sysroot.sh -y
+
+          if grep -R -n '@UBUNTU_CODENAME@\|Ubuntu 26.04' sysroot/etc/issue sysroot/mirror.sh; then
+            echo "error: stale Ubuntu version placeholder found in generated sysroot files" >&2
+            exit 1
+          fi
+
+          sudo ./script/export_sysroot.sh
+
+          initrd_path="$(
+            find output -maxdepth 1 -type f -name 'initrd-*.zst' -printf '%T@ %p\n' \
+              | sort -n \
+              | tail -n 1 \
+              | cut -d' ' -f2-
+          )"
+          [[ -n "$initrd_path" ]] || {
+            echo "error: no initrd artifact found under output/" >&2
+            exit 1
+          }
+
+          {
+            echo "initrd_path=$initrd_path"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Build ISO
+        id: iso
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./script/make_bootable.sh \
+            "${{ steps.kernel_output.outputs.kernel_path }}" \
+            "${{ steps.initrd.outputs.initrd_path }}"
+
+          iso_path="$(
+            find output -maxdepth 1 -type f -name 'bootable-*.iso' -printf '%T@ %p\n' \
+              | sort -n \
+              | tail -n 1 \
+              | cut -d' ' -f2-
+          )"
+          [[ -n "$iso_path" ]] || {
+            echo "error: no ISO artifact found under output/" >&2
+            exit 1
+          }
+
+          xorriso -indev "$iso_path" -report_el_torito plain
+
+          {
+            echo "iso_path=$iso_path"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Package ISO artifact
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          artifact_dir="$RUNNER_TEMP/grub4dos-iso-artifact"
+          mkdir -p "$artifact_dir"
+
+          cp "${{ steps.iso.outputs.iso_path }}" "$artifact_dir/"
+          cp "${{ steps.kernel_output.outputs.kernel_path }}" "$artifact_dir/bzImage"
+          cp "${{ steps.initrd.outputs.initrd_path }}" "$artifact_dir/initrd.zst"
+
+          {
+            echo "kernel_input=${{ inputs.kernel }}"
+            echo "kernel_path=${{ steps.kernel_output.outputs.kernel_path }}"
+            echo "ubuntu_base_input=${{ inputs.ubuntu_base }}"
+            echo "ubuntu_base_url=${{ steps.ubuntu_base.outputs.tarball_url }}"
+            echo "initrd_path=${{ steps.initrd.outputs.initrd_path }}"
+            echo "iso_path=${{ steps.iso.outputs.iso_path }}"
+          } >"$artifact_dir/metadata.txt"
+
+          {
+            echo "artifact_dir=$artifact_dir"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grub4dos-iso-${{ github.run_id }}
+          path: ${{ steps.package.outputs.artifact_dir }}
+          if-no-files-found: error

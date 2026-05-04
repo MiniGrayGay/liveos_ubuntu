@@ -11,6 +11,7 @@ DEFAULT_QEMU_APPEND_GUI="console=tty0 rdinit=/init loglevel=8 ignore_loglevel pr
 DEFAULT_QEMU_APPEND_NOGRAPHIC="console=ttyS0,115200 rdinit=/init loglevel=8 ignore_loglevel printk.time=1"
 DRY_RUN=0
 GUI=0
+MUX="${QEMU_MUX:-auto}"
 POSITIONAL_KERNEL_PATH=
 POSITIONAL_INITRD_PATH=
 USER_KERNEL_PROVIDED=0
@@ -33,10 +34,12 @@ Default behavior:
   - GUI mode passes -append "console=tty0 rdinit=/init loglevel=8 ignore_loglevel printk.time=1"
   - nographic mode passes -append "console=ttyS0,115200 rdinit=/init loglevel=8 ignore_loglevel printk.time=1"
   - pass -no-reboot, and add -nographic unless --gui is used
+  - nographic mode runs in tmux or screen when available, preferring tmux
 
 Options:
   --qemu-bin PATH   QEMU binary, default: qemu-system-x86_64
   --gui             Do not add -nographic
+  --no-mux          Do not wrap nographic QEMU in tmux/screen
   --dry-run         Print the resolved command without launching QEMU
   -h, --help        Show this help text
 
@@ -49,6 +52,7 @@ Environment overrides:
   QEMU_MEMORY
   QEMU_SMP
   QEMU_APPEND
+  QEMU_MUX=auto|tmux|screen|none
 EOF
 }
 
@@ -56,6 +60,55 @@ require_command() {
   local command_name=$1
 
   command -v "$command_name" >/dev/null 2>&1 || die "required command not found: $command_name"
+}
+
+quote_command() {
+  local quoted=
+  local piece=
+  local arg
+
+  for arg in "$@"; do
+    printf -v piece '%q' "$arg"
+    if [ -n "$quoted" ]; then
+      quoted+=" "
+    fi
+    quoted+="$piece"
+  done
+
+  printf '%s\n' "$quoted"
+}
+
+resolve_mux() {
+  if [ "$GUI" -eq 1 ]; then
+    printf 'none\n'
+    return
+  fi
+
+  case "$MUX" in
+    auto)
+      if command -v tmux >/dev/null 2>&1; then
+        printf 'tmux\n'
+      elif command -v screen >/dev/null 2>&1; then
+        printf 'screen\n'
+      else
+        printf 'none\n'
+      fi
+      ;;
+    tmux)
+      require_command tmux
+      printf 'tmux\n'
+      ;;
+    screen)
+      require_command screen
+      printf 'screen\n'
+      ;;
+    none)
+      printf 'none\n'
+      ;;
+    *)
+      die "invalid QEMU_MUX value: $MUX"
+      ;;
+  esac
 }
 
 find_latest_standard_kernel() {
@@ -109,6 +162,10 @@ while [ $# -gt 0 ]; do
       GUI=1
       shift
       ;;
+    --no-mux)
+      MUX=none
+      shift
+      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -160,6 +217,7 @@ done
 [ -d "$OUTPUT_DIR" ] || die "output directory not found: $OUTPUT_DIR"
 require_command "$QEMU_BIN"
 
+ENV_QEMU_APPEND="${QEMU_APPEND:-}"
 KERNEL_PATH=
 INITRD_PATH=
 QEMU_APPEND=
@@ -181,8 +239,8 @@ if [ "$USER_INITRD_PROVIDED" -eq 0 ]; then
 fi
 
 if [ "$USER_APPEND_PROVIDED" -eq 0 ]; then
-  if [ -n "${QEMU_APPEND:-}" ]; then
-    QEMU_APPEND=$QEMU_APPEND
+  if [ -n "$ENV_QEMU_APPEND" ]; then
+    QEMU_APPEND=$ENV_QEMU_APPEND
   elif [ "$GUI" -eq 1 ]; then
     QEMU_APPEND=$DEFAULT_QEMU_APPEND_GUI
   else
@@ -202,7 +260,7 @@ declare -a QEMU_ARGS=(
   -machine accel=kvm:tcg
   -m "$QEMU_MEMORY"
   -smp "$QEMU_SMP"
-  -nic user,model=virtio-net-pci
+  -nic "user,model=virtio-net-pci"
   -no-reboot
 )
 
@@ -230,16 +288,43 @@ if [ "${#USER_QEMU_ARGS[@]}" -gt 0 ]; then
   QEMU_ARGS+=("${USER_QEMU_ARGS[@]}")
 fi
 
+RESOLVED_MUX="$(resolve_mux)"
+QEMU_COMMAND="$(quote_command "$QEMU_BIN" "${QEMU_ARGS[@]}")"
+
 printf 'Kernel : %s\n' "${KERNEL_PATH:-<from user qemu args>}"
 printf 'Initrd : %s\n' "${INITRD_PATH:-<from user qemu args>}"
 printf 'Append : %s\n' "${QEMU_APPEND:-<from user qemu args>}"
 printf 'QEMU   : %s\n' "$QEMU_BIN"
+printf 'Mux    : %s\n' "$RESOLVED_MUX"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf 'Command:'
-  printf ' %q' "$QEMU_BIN" "${QEMU_ARGS[@]}"
+  case "$RESOLVED_MUX" in
+    tmux)
+      printf ' %q' tmux new-session "$QEMU_COMMAND"
+      ;;
+    screen)
+      printf ' %q' screen "$QEMU_BIN" "${QEMU_ARGS[@]}"
+      ;;
+    none)
+      printf ' %q' "$QEMU_BIN" "${QEMU_ARGS[@]}"
+      ;;
+  esac
   printf '\n'
   exit 0
 fi
 
-exec "$QEMU_BIN" "${QEMU_ARGS[@]}"
+case "$RESOLVED_MUX" in
+  tmux)
+    if [ -n "${TMUX:-}" ]; then
+      exec tmux new-window "$QEMU_COMMAND"
+    fi
+    exec tmux new-session "$QEMU_COMMAND"
+    ;;
+  screen)
+    exec screen "$QEMU_BIN" "${QEMU_ARGS[@]}"
+    ;;
+  none)
+    exec "$QEMU_BIN" "${QEMU_ARGS[@]}"
+    ;;
+esac
