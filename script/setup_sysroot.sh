@@ -14,6 +14,7 @@ ROOT_PASSWORD='123@@@'
 DEFAULT_USER=ubuntu
 DEFAULT_USER_PASSWORD=ubuntu
 RESET_SYSROOT_MODE=ask
+UBUNTU_BASE_TARBALL="${UBUNTU_BASE_TARBALL:-}"
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -137,7 +138,21 @@ unmount_all_sysroot_mounts() {
 }
 
 find_latest_ubuntu_base() {
-  local latest
+  local latest requested
+
+  if [ -n "$UBUNTU_BASE_TARBALL" ]; then
+    case "$UBUNTU_BASE_TARBALL" in
+      /*)
+        requested=$UBUNTU_BASE_TARBALL
+        ;;
+      *)
+        requested="$ROOT_DIR/$UBUNTU_BASE_TARBALL"
+        ;;
+    esac
+    [ -f "$requested" ] || return 1
+    printf '%s\n' "$requested"
+    return 0
+  fi
 
   latest="$(
     find "$ROOT_DIR" -maxdepth 1 -type f \

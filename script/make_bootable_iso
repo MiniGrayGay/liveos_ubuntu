@@ -4,8 +4,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT_DIR="$ROOT_DIR/output"
-ISO_TEMPLATE_DIR="$ROOT_DIR/grub4dos/iso"
-ISO_LABEL="MiniGG_BOOT"
+GRUB4DOS_DIR="$ROOT_DIR/grub4dos"
+ISO_LABEL="${ISO_LABEL:-MiniGG_BOOT}"
+TMP_DIR=
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -20,13 +21,18 @@ Default behavior:
   - load the highest-version non-mod kernel from output/<version>/bzImage
     or legacy output/bzImage_*
   - load the newest initramfs from output/initrd-*.zst
-  - copy them into grub4dos/iso as /bzImage and /initrd.zst
-  - build the ISO directly from grub4dos/iso via xorrisofs
+  - build missing grub4dos legacy and EFI artifacts via grub4dos/Makefile
   - write the final ISO to output/bootable-YYYYMMDD-HHMMSS.iso
 
 Requirements:
-  xorrisofs
+  make and the grub4dos project build tools
 EOF
+}
+
+cleanup() {
+  if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then
+    rm -rf -- "$TMP_DIR"
+  fi
 }
 
 require_command() {
@@ -40,6 +46,13 @@ require_file() {
   local description=$2
 
   [ -f "$path" ] || die "$description not found: $path"
+}
+
+require_dir() {
+  local path=$1
+  local description=$2
+
+  [ -d "$path" ] || die "$description not found: $path"
 }
 
 find_latest_standard_kernel() {
@@ -97,21 +110,66 @@ next_output_path() {
   done
 }
 
-build_iso() {
-  local output_iso=$1
+write_menu() {
+  local menu_path=$1
 
-  xorrisofs \
-    -o "$output_iso" \
-    -V "$ISO_LABEL" \
-    -J -R \
-    -b grldr \
-    -no-emul-boot \
-    -boot-load-size 4 \
-    -boot-info-table \
-    -eltorito-alt-boot \
-    -e efisys.bin \
-    -no-emul-boot \
-    "$ISO_TEMPLATE_DIR"
+  mkdir -p "$(dirname "$menu_path")"
+  cat >"$menu_path" <<'EOF'
+default 0
+timeout 0
+debug off
+
+title Boot Ubuntu LiveOS
+	find --set-root /bzImage
+	kernel /bzImage
+	initrd /initrd.zst
+
+title Reboot
+	reboot
+
+title Shutdown
+	halt
+EOF
+}
+
+ensure_grub4dos_artifacts() {
+  local grldr="$GRUB4DOS_DIR/artifacts/0.4.6a/grldr"
+  local efisys="$GRUB4DOS_DIR/artifacts/efi/efisys.bin"
+
+  require_dir "$GRUB4DOS_DIR" "grub4dos project directory"
+  require_file "$GRUB4DOS_DIR/Makefile" "grub4dos project Makefile"
+  require_command make
+
+  make -C "$GRUB4DOS_DIR" check-tools
+
+  if [ ! -f "$grldr" ] || [ ! -f "$efisys" ]; then
+    make -C "$GRUB4DOS_DIR" both
+  fi
+
+  require_file "$grldr" "grub4dos BIOS loader"
+  require_file "$efisys" "EFI boot image"
+}
+
+build_iso() {
+  local kernel_path=$1
+  local initrd_path=$2
+  local output_iso=$3
+  local iso_root
+
+  ensure_grub4dos_artifacts
+
+  TMP_DIR="$(mktemp -d "$OUTPUT_DIR/.bootable-iso.XXXXXX")"
+  iso_root="$TMP_DIR/iso_root"
+
+  mkdir -p "$iso_root"
+  cp "$kernel_path" "$iso_root/bzImage"
+  cp "$initrd_path" "$iso_root/initrd.zst"
+  write_menu "$iso_root/efi/grub/menu.lst"
+
+  make -C "$GRUB4DOS_DIR" iso \
+    ISO_ROOT="$iso_root" \
+    ISO_OUT="$output_iso" \
+    ISO_LABEL="$ISO_LABEL"
 }
 
 if [ $# -gt 2 ]; then
@@ -125,8 +183,9 @@ if [ $# -ge 1 ] && { [ "$1" = "-h" ] || [ "$1" = "--help" ]; }; then
   exit 0
 fi
 
-[ -d "$OUTPUT_DIR" ] || die "output directory not found: $OUTPUT_DIR"
-[ -d "$ISO_TEMPLATE_DIR" ] || die "ISO template directory not found: $ISO_TEMPLATE_DIR"
+trap cleanup EXIT
+
+mkdir -p "$OUTPUT_DIR"
 
 KERNEL_PATH="${1:-}"
 INITRD_PATH="${2:-}"
@@ -141,18 +200,11 @@ fi
 
 require_file "$KERNEL_PATH" "kernel image"
 require_file "$INITRD_PATH" "initramfs image"
-require_file "$ISO_TEMPLATE_DIR/grldr" "grub4dos BIOS loader"
-require_file "$ISO_TEMPLATE_DIR/efisys.bin" "EFI boot image"
-
-require_command xorrisofs
-
-cp "$KERNEL_PATH" "$ISO_TEMPLATE_DIR/bzImage"
-cp "$INITRD_PATH" "$ISO_TEMPLATE_DIR/initrd.zst"
 
 OUTPUT_ISO="$(next_output_path)"
-build_iso "$OUTPUT_ISO"
+build_iso "$KERNEL_PATH" "$INITRD_PATH" "$OUTPUT_ISO"
 
 printf 'Kernel : %s\n' "$KERNEL_PATH"
 printf 'Initrd : %s\n' "$INITRD_PATH"
-printf 'Source : %s\n' "$ISO_TEMPLATE_DIR"
+printf 'Source : %s\n' "$GRUB4DOS_DIR"
 printf 'ISO    : %s\n' "$OUTPUT_ISO"

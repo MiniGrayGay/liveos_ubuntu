@@ -12,6 +12,7 @@
 !/build/.gitkeep
 
 /archlinux/
+/grub4dos
 
 # Editor and OS temporary files
 /.vscode/
