@@ -24,7 +24,8 @@ KNOWN_TARGETS := \
 	kernel kernel-mod kernel-both kernel-all \
 	busybox-static dropbear-static sftp-static static-tools ensure-static-tools \
 	ubuntu-base setup-sysroot setup-sysroot-ask setup-sysroot-keep export-sysroot initrd sysroot rootfs \
-	grub4dos-framework iso pack-iso qemu qemu-gui qemu-dry-run \
+	grub4dos-framework iso pack-iso \
+	qemu qemu-gui qemu-dry-run \
 	clean clean-static clean-rootfs
 KERNEL_POSITIONAL_TARGETS := kernel kernel-mod kernel-both
 KERNEL_ARG_GOALS :=
@@ -56,7 +57,8 @@ UBUNTU_BASE_TARBALL ?= $(notdir $(UBUNTU_BASE_URL))
 .PHONY: kernel kernel-mod kernel-both kernel-all
 .PHONY: busybox-static dropbear-static sftp-static static-tools ensure-static-tools
 .PHONY: ubuntu-base setup-sysroot setup-sysroot-ask setup-sysroot-keep export-sysroot initrd sysroot rootfs
-.PHONY: grub4dos-framework iso pack-iso qemu qemu-gui qemu-dry-run
+.PHONY: grub4dos-framework iso pack-iso
+.PHONY: qemu qemu-gui qemu-dry-run
 .PHONY: clean clean-static clean-rootfs
 
 POSITIONAL_ARG_GOALS := $(KERNEL_ARG_GOALS) $(SYSROOT_ARG_GOALS)
@@ -80,7 +82,7 @@ help: ## Show available targets
 	@printf "  JOBS=%s                Parallel build jobs\n" "$(JOBS)"
 	@printf "  SETUP_FLAGS=%s         Flags for setup_sysroot.sh\n" "$(SETUP_FLAGS)"
 	@printf "  QEMU_ARGS=...          Extra args for run_qemu.sh\n"
-	@printf "  ISO_ARGS=...           Optional kernel/initrd args for make_bootable.sh\n"
+	@printf "  ISO_ARGS=...           Optional kernel/initrd args for pack-iso\n"
 	@printf "  UBUNTU_BASE_VERSION=%s Ubuntu base version for make sysroot\n" "$(UBUNTU_BASE_VERSION)"
 	@printf "  UBUNTU_BASE_URL=...    Ubuntu base tarball URL for make sysroot\n"
 	@printf "  ISO_KERNEL=%s           Kernel input for make iso\n" "$(ISO_KERNEL)"
@@ -103,10 +105,17 @@ status: ## Show key artifacts and git status
 	@printf "Artifacts:\n"
 	@ls -lh \
 		"$(ROOT_DIR)/busybox" \
+		"$(ROOT_DIR)/busybox_aarch64" \
 		"$(ROOT_DIR)/dropbearmulti" \
+		"$(ROOT_DIR)/dropbearmulti_aarch64" \
+		"$(ROOT_DIR)/sftp-server" \
+		"$(ROOT_DIR)/sftp-server_aarch64" \
 		"$(ROOT_DIR)/build/busybox-static/artifacts/busybox" \
+		"$(ROOT_DIR)/build/busybox-static/artifacts/busybox_aarch64" \
 		"$(ROOT_DIR)/build/dropbear-static/artifacts/dropbearmulti" \
+		"$(ROOT_DIR)/build/dropbear-static/artifacts/dropbearmulti_aarch64" \
 		"$(ROOT_DIR)/build/openssh-static/artifacts/sftp-server" \
+		"$(ROOT_DIR)/build/openssh-static/artifacts/sftp-server_aarch64" \
 		"$(OUTPUT_DIR)"/initrd-*.zst 2>/dev/null || true
 	@printf "\nGit status:\n"
 	@git status --short
@@ -257,19 +266,23 @@ clean: ## Remove all generated build artifacts
 			umount -R "$$target" || umount -Rl "$$target"; \
 		done; \
 	fi
-	@echo "Removing build/, output/, sysroot/, rootfs/, and root-level binaries"
-	@mkdir -p "$(ROOT_DIR)/build" "$(OUTPUT_DIR)" "$(ROOT_DIR)/sysroot"
-	@find "$(ROOT_DIR)/build" -mindepth 1 ! -name .gitkeep -exec rm -rf -- {} +
-	@find "$(OUTPUT_DIR)" -mindepth 1 ! -name .gitkeep -exec rm -rf -- {} +
-	@find "$(ROOT_DIR)/sysroot" -mindepth 1 ! -name .gitkeep -exec rm -rf -- {} +
+	@echo "Removing build/, output/, tmp/, sysroot/, rootfs/, and root-level binaries"
 	@rm -rf \
+		"$(ROOT_DIR)/build" \
+		"$(OUTPUT_DIR)" \
+		"$(ROOT_DIR)/tmp" \
+		"$(ROOT_DIR)/sysroot" \
 		"$(ROOT_DIR)/rootfs" \
 		"$(ROOT_DIR)/busybox" \
+		"$(ROOT_DIR)/busybox_aarch64" \
 		"$(ROOT_DIR)/dropbearmulti" \
-		"$(ROOT_DIR)/sftp-server"
-	@if [ -d "$(ROOT_DIR)/grub4dos/iso" ]; then \
-		rm -f "$(ROOT_DIR)/grub4dos/iso/bzImage" "$(ROOT_DIR)/grub4dos/iso/initrd.zst"; \
-	fi
+		"$(ROOT_DIR)/dropbearmulti_aarch64" \
+		"$(ROOT_DIR)/sftp-server" \
+		"$(ROOT_DIR)/sftp-server_aarch64"
+	@rm -rf "$${TMPDIR:-/tmp}"/compile-kernel.*
+	@mkdir -p "$(ROOT_DIR)/build" "$(OUTPUT_DIR)"
+	@printf '\n' >"$(ROOT_DIR)/build/.gitkeep"
+	@printf '\n' >"$(OUTPUT_DIR)/.gitkeep"
 	@echo "Cleaned generated artifacts"
 
 clean-static: ## Remove static-tool build trees and root-level static artifacts
@@ -278,8 +291,11 @@ clean-static: ## Remove static-tool build trees and root-level static artifacts
 		"$(ROOT_DIR)/build/dropbear-static" \
 		"$(ROOT_DIR)/build/openssh-static" \
 		"$(ROOT_DIR)/busybox" \
+		"$(ROOT_DIR)/busybox_aarch64" \
 		"$(ROOT_DIR)/dropbearmulti" \
-		"$(ROOT_DIR)/sftp-server"
+		"$(ROOT_DIR)/dropbearmulti_aarch64" \
+		"$(ROOT_DIR)/sftp-server" \
+		"$(ROOT_DIR)/sftp-server_aarch64"
 
 clean-rootfs: ## Remove rootfs staging directory created by sftp build
 	rm -rf "$(ROOT_DIR)/rootfs"

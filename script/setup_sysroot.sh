@@ -15,6 +15,7 @@ DEFAULT_USER=ubuntu
 DEFAULT_USER_PASSWORD=ubuntu
 RESET_SYSROOT_MODE=ask
 UBUNTU_BASE_TARBALL="${UBUNTU_BASE_TARBALL:-}"
+REINSTALL_SCRIPT_URL="${REINSTALL_SCRIPT_URL:-https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.sh}"
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -78,6 +79,47 @@ cleanup_dir_contents() {
   mkdir -p "$dir"
   find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
   echo "Cleaned $dir"
+}
+
+write_download_reinstall_script() {
+  local target="$SYSROOT_DIR/usr/bin/download_reinstall"
+
+  mkdir -p "$(dirname "$target")"
+  cat >"$target" <<EOF
+#!/bin/sh
+
+set -eu
+
+url='$REINSTALL_SCRIPT_URL'
+target=./reinstall.sh
+tmp="\$target.tmp.\$\$"
+
+cleanup() {
+  rm -f "\$tmp"
+}
+
+trap cleanup EXIT HUP INT TERM
+
+if command -v curl >/dev/null 2>&1; then
+  curl -fL -o "\$tmp" "\$url"
+elif command -v wget >/dev/null 2>&1; then
+  wget -O "\$tmp" "\$url"
+elif [ -x /usr/bin/busybox ]; then
+  /usr/bin/busybox wget -O "\$tmp" "\$url"
+else
+  echo "error: curl, wget, or busybox wget is required" >&2
+  exit 1
+fi
+
+chmod 755 "\$tmp"
+mv -f "\$tmp" "\$target"
+trap - EXIT HUP INT TERM
+
+echo "Downloaded ./reinstall.sh"
+echo "Run it with: ./reinstall.sh"
+EOF
+  chmod 755 "$target"
+  echo "Configured $target"
 }
 
 umount_if_mounted() {
@@ -368,6 +410,7 @@ sed -i "s/@UBUNTU_CODENAME@/${UBUNTU_CODENAME}/g" "$SYSROOT_DIR/mirror.sh"
 chmod 755 "$SYSROOT_DIR/mirror.sh"
 install -Dm755 "$ROOT_DIR/script/init" "$SYSROOT_DIR/init"
 install -Dm755 "$ROOT_DIR/script/udhcpc.default.script" "$SYSROOT_DIR/usr/share/udhcpc/default.script"
+write_download_reinstall_script
 
 echo "Configured $ETC_DIR/resolv.conf"
 echo "Configured $ETC_DIR/hostname"

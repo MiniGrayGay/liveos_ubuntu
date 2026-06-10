@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT_DIR="$ROOT_DIR/output"
 GRUB4DOS_DIR="$ROOT_DIR/grub4dos"
-ISO_LABEL="${ISO_LABEL:-MiniGG_BOOT}"
+ISO_LABEL="${ISO_LABEL:-MINIGG_BOOT}"
 TMP_DIR=
 
 die() {
@@ -19,13 +19,12 @@ Usage: script/make_bootable_iso [kernel_path] [initramfs_path]
 
 Default behavior:
   - load the highest-version non-mod kernel from output/<version>/bzImage
-    or legacy output/bzImage_*
   - load the newest initramfs from output/initrd-*.zst
   - build missing grub4dos legacy and EFI artifacts via grub4dos/Makefile
   - write the final ISO to output/bootable-YYYYMMDD-HHMMSS.iso
 
 Requirements:
-  make and the grub4dos project build tools
+  make, xorriso, and the grub4dos project build tools
 EOF
 }
 
@@ -166,7 +165,7 @@ build_iso() {
   cp "$initrd_path" "$iso_root/initrd.zst"
   write_menu "$iso_root/efi/grub/menu.lst"
 
-  make -C "$GRUB4DOS_DIR" iso \
+  make -C "$GRUB4DOS_DIR" iso-only \
     ISO_ROOT="$iso_root" \
     ISO_OUT="$output_iso" \
     ISO_LABEL="$ISO_LABEL"

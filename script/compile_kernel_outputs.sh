@@ -13,20 +13,23 @@ source "$ROOT_DIR/script/kernel_source_matrix.sh"
 
 usage() {
   cat <<'EOF'
-Usage: compile_kernel_outputs.sh [--mod|--std|--both] [version|version-mod|x.y.z|/path/to/linux-source ...]
+Usage: compile_kernel_outputs.sh [--aarch64|--x86_64] [--mod|--std|--both] [version|version-mod|x.y.z|/path/to/linux-source ...]
 
 Without arguments:
   Build all configured series in both standard and modular flavors using the
-  canonical patch versions from kernel.org, downloading them when needed.
+  latest active patch versions from kernel.org, downloading them when needed.
 
 With arguments:
   --mod           Build only the modular flavor for following inputs
   --std           Build only the standard flavor for following inputs
   --both          Build both flavors for following inputs (default)
-  5.10            Build standard and modular outputs for series 5.10 using
-                  linux-5.10.252
+  --aarch64       Build arm64/aarch64 kernel images. Outputs are written to
+                  output/<version>-aarch64 and output/<version>-aarch64-mod.
+  --x86_64        Build x86_64 kernel images (default)
+  5.10            Build standard and modular outputs for the latest active
+                  5.10.y release from kernel.org
   6.18-mod        Build only the modular output for series 6.18 using
-                  linux-6.18.22
+                  the latest active 6.18.y release from kernel.org
   6.18.22         Build standard and modular outputs for linux-6.18.22
   /path/linux-6.18.22
                   Use the provided source tree and the nearest matching config
@@ -40,6 +43,7 @@ Examples:
   ./script/compile_kernel_outputs.sh 6.18-mod
   ./script/compile_kernel_outputs.sh 6.18.22
   ./script/compile_kernel_outputs.sh --mod 6.18.22
+  ./script/compile_kernel_outputs.sh --aarch64 6.18
   ./script/compile_kernel_outputs.sh /tmp/linux-6.19.11.tar.xz
 EOF
 }
@@ -181,19 +185,96 @@ ensure_source_tree_for_exact_version() {
   resolve_source_tree "$archive_path"
 }
 
+kernel_make_vars_for_arch() {
+  local target_arch=$1
+
+  case "$target_arch" in
+    x86_64)
+      printf '%s\n' "ARCH=x86"
+      ;;
+    aarch64)
+      printf '%s\n' "ARCH=arm64" "CROSS_COMPILE=${AARCH64_CROSS_COMPILE:-aarch64-linux-gnu-}"
+      ;;
+    *)
+      printf 'error: unsupported target architecture: %s\n' "$target_arch" >&2
+      exit 1
+      ;;
+  esac
+}
+
+kernel_image_target_for_arch() {
+  local target_arch=$1
+
+  case "$target_arch" in
+    x86_64) printf '%s\n' "bzImage" ;;
+    aarch64) printf '%s\n' "Image.gz" ;;
+    *)
+      printf 'error: unsupported target architecture: %s\n' "$target_arch" >&2
+      exit 1
+      ;;
+  esac
+}
+
+kernel_image_path_for_arch() {
+  local target_arch=$1
+  local build_dir=$2
+
+  case "$target_arch" in
+    x86_64) printf '%s\n' "$build_dir/arch/x86/boot/bzImage" ;;
+    aarch64) printf '%s\n' "$build_dir/arch/arm64/boot/Image.gz" ;;
+    *)
+      printf 'error: unsupported target architecture: %s\n' "$target_arch" >&2
+      exit 1
+      ;;
+  esac
+}
+
+kernel_output_image_name_for_arch() {
+  local target_arch=$1
+
+  case "$target_arch" in
+    x86_64) printf '%s\n' "bzImage" ;;
+    aarch64) printf '%s\n' "Image.gz" ;;
+    *)
+      printf 'error: unsupported target architecture: %s\n' "$target_arch" >&2
+      exit 1
+      ;;
+  esac
+}
+
+require_arch_tools() {
+  local target_arch=$1
+  local cross_compile
+
+  if [[ "$target_arch" == "aarch64" ]]; then
+    cross_compile=${AARCH64_CROSS_COMPILE:-aarch64-linux-gnu-}
+    require_tool "${cross_compile}gcc"
+  fi
+}
+
 build_one() {
   local display_ver=$1
   local config_ver=$2
   local source_dir=$3
   local flavor=$4
+  local target_arch=${5:-x86_64}
   local source_series=$display_ver
 
   local config_suffix=""
   local output_name="$display_ver"
+  local arch_suffix=""
   local modules_enabled=0
+  local loadable_modules_enabled=0
+
+  if [[ "$target_arch" == "aarch64" ]]; then
+    arch_suffix="-aarch64"
+  fi
+
   if [[ "$flavor" == "modular" ]]; then
     config_suffix="-modular"
-    output_name="${display_ver}-mod"
+    output_name="${display_ver}${arch_suffix}-mod"
+  else
+    output_name="${display_ver}${arch_suffix}"
   fi
 
   if [[ "$display_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -203,7 +284,15 @@ build_one() {
   local config_path="$KERNEL_DIR/linux-${config_ver}${config_suffix}.config"
   local target_dir="$OUTPUT_DIR/$output_name"
   local build_dir="$target_dir/build"
-  local image_path="$build_dir/arch/x86/boot/bzImage"
+  local image_target
+  local image_path
+  local output_image_name
+  local -a make_vars=()
+
+  mapfile -t make_vars < <(kernel_make_vars_for_arch "$target_arch")
+  image_target=$(kernel_image_target_for_arch "$target_arch")
+  image_path=$(kernel_image_path_for_arch "$target_arch" "$build_dir")
+  output_image_name=$(kernel_output_image_name_for_arch "$target_arch")
 
   [[ -d "$source_dir" ]] || {
     printf 'error: source tree not found: %s\n' "$source_dir" >&2
@@ -214,29 +303,37 @@ build_one() {
     exit 1
   }
 
+  require_arch_tools "$target_arch"
+
   echo "==> Building $output_name from $(basename "$source_dir") using linux-${config_ver}${config_suffix}.config"
   rm -rf "$target_dir"
   mkdir -p "$build_dir"
 
   cp "$config_path" "$build_dir/.config"
 
-  make -C "$source_dir" O="$build_dir" olddefconfig
+  make -C "$source_dir" O="$build_dir" "${make_vars[@]}" olddefconfig
   if grep -q '^CONFIG_MODULES=y' "$build_dir/.config"; then
     modules_enabled=1
-    make -C "$source_dir" O="$build_dir" -j"$JOBS" bzImage modules
+  fi
+  if grep -q '=m$' "$build_dir/.config"; then
+    loadable_modules_enabled=1
+  fi
+
+  if [[ "$loadable_modules_enabled" -eq 1 ]]; then
+    make -C "$source_dir" O="$build_dir" "${make_vars[@]}" -j"$JOBS" "$image_target" modules
   else
-    make -C "$source_dir" O="$build_dir" -j"$JOBS" bzImage
+    make -C "$source_dir" O="$build_dir" "${make_vars[@]}" -j"$JOBS" "$image_target"
   fi
 
   local kernelrelease
-  kernelrelease=$(make -s -C "$source_dir" O="$build_dir" kernelrelease)
+  kernelrelease=$(make -s -C "$source_dir" O="$build_dir" "${make_vars[@]}" kernelrelease)
 
-  if [[ "$modules_enabled" -eq 1 ]]; then
-    make -C "$source_dir" O="$build_dir" INSTALL_MOD_PATH="$target_dir" modules_install
+  if [[ "$loadable_modules_enabled" -eq 1 ]]; then
+    make -C "$source_dir" O="$build_dir" "${make_vars[@]}" INSTALL_MOD_PATH="$target_dir" modules_install
     depmod -b "$target_dir" -F "$build_dir/System.map" "$kernelrelease"
   fi
 
-  cp "$image_path" "$target_dir/bzImage"
+  cp "$image_path" "$target_dir/$output_image_name"
   cp "$build_dir/vmlinux" "$target_dir/vmlinux"
   cp "$build_dir/System.map" "$target_dir/System.map"
   cp "$build_dir/.config" "$target_dir/config"
@@ -248,10 +345,18 @@ build_one() {
     printf 'source_series=%s\n' "$source_series"
     printf 'config_series=%s\n' "$config_ver"
     printf 'config=%s\n' "$config_path"
+    printf 'target_arch=%s\n' "$target_arch"
+    printf 'kernel_arch=%s\n' "${make_vars[0]#ARCH=}"
+    printf 'image_target=%s\n' "$image_target"
+    printf 'image_file=%s\n' "$target_dir/$output_image_name"
+    if [[ "$target_arch" == "aarch64" ]]; then
+      printf 'cross_compile=%s\n' "${AARCH64_CROSS_COMPILE:-aarch64-linux-gnu-}"
+    fi
     printf 'kernelrelease=%s\n' "$kernelrelease"
     printf 'jobs=%s\n' "$JOBS"
     printf 'modules_enabled=%s\n' "$modules_enabled"
-    if [[ "$modules_enabled" -eq 1 ]]; then
+    printf 'loadable_modules_enabled=%s\n' "$loadable_modules_enabled"
+    if [[ "$loadable_modules_enabled" -eq 1 ]]; then
       printf 'modules_dir=%s\n' "$target_dir/lib/modules/$kernelrelease"
     fi
   } >"$target_dir/build-info.txt"
@@ -261,6 +366,7 @@ build_from_detected_version() {
   local detected_version=$1
   local source_dir=$2
   local mode=$3
+  local target_arch=${4:-x86_64}
   local config_ver
 
   config_ver=$(kernel_find_best_series_for_version "$detected_version") || {
@@ -270,14 +376,14 @@ build_from_detected_version() {
 
   case "$mode" in
     standard)
-      build_one "$detected_version" "$config_ver" "$source_dir" standard
+      build_one "$detected_version" "$config_ver" "$source_dir" standard "$target_arch"
       ;;
     modular)
-      build_one "$detected_version" "$config_ver" "$source_dir" modular
+      build_one "$detected_version" "$config_ver" "$source_dir" modular "$target_arch"
       ;;
     both)
-      build_one "$detected_version" "$config_ver" "$source_dir" standard
-      build_one "$detected_version" "$config_ver" "$source_dir" modular
+      build_one "$detected_version" "$config_ver" "$source_dir" standard "$target_arch"
+      build_one "$detected_version" "$config_ver" "$source_dir" modular "$target_arch"
       ;;
   esac
 }
@@ -300,12 +406,14 @@ main() {
   local detected_version
   local mode=both
   local short_ver
+  local target_arch=x86_64
+  local built_any=0
 
   if [[ "$#" -eq 0 ]]; then
     for short_ver in "${KERNEL_SERIES[@]}"; do
       source_dir=$(ensure_source_tree_for_series "$short_ver")
-      build_one "$short_ver" "$short_ver" "$source_dir" standard
-      build_one "$short_ver" "$short_ver" "$source_dir" modular
+      build_one "$short_ver" "$short_ver" "$source_dir" standard "$target_arch"
+      build_one "$short_ver" "$short_ver" "$source_dir" modular "$target_arch"
     done
     return
   fi
@@ -324,6 +432,14 @@ main() {
         mode=both
         continue
         ;;
+      --aarch64|--arm64)
+        target_arch=aarch64
+        continue
+        ;;
+      --x86_64|--amd64|--x86)
+        target_arch=x86_64
+        continue
+        ;;
       -h|--help)
         usage
         return
@@ -339,7 +455,8 @@ main() {
         printf 'error: could not resolve a kernel source tree from: %s\n' "$request" >&2
         exit 1
       }
-      build_from_detected_version "$detected_version" "$source_dir" "$mode"
+      build_from_detected_version "$detected_version" "$source_dir" "$mode" "$target_arch"
+      built_any=1
       continue
     fi
 
@@ -358,14 +475,15 @@ main() {
     if [[ "$base_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       source_dir=$(ensure_source_tree_for_exact_version "$base_ver")
       if [[ "$flavor" == "modular" ]]; then
-        build_from_detected_version "$base_ver" "$source_dir" modular
+        build_from_detected_version "$base_ver" "$source_dir" modular "$target_arch"
       elif [[ "$mode" == "standard" ]]; then
-        build_from_detected_version "$base_ver" "$source_dir" standard
+        build_from_detected_version "$base_ver" "$source_dir" standard "$target_arch"
       elif [[ "$mode" == "modular" ]]; then
-        build_from_detected_version "$base_ver" "$source_dir" modular
+        build_from_detected_version "$base_ver" "$source_dir" modular "$target_arch"
       else
-        build_from_detected_version "$base_ver" "$source_dir" both
+        build_from_detected_version "$base_ver" "$source_dir" both "$target_arch"
       fi
+      built_any=1
       continue
     fi
 
@@ -377,16 +495,31 @@ main() {
     source_dir=$(ensure_source_tree_for_series "$base_ver")
 
     if [[ "$flavor" == "modular" ]]; then
-      build_one "$base_ver" "$base_ver" "$source_dir" modular
+      build_one "$base_ver" "$base_ver" "$source_dir" modular "$target_arch"
     elif [[ "$mode" == "standard" ]]; then
-      build_one "$base_ver" "$base_ver" "$source_dir" standard
+      build_one "$base_ver" "$base_ver" "$source_dir" standard "$target_arch"
     elif [[ "$mode" == "modular" ]]; then
-      build_one "$base_ver" "$base_ver" "$source_dir" modular
+      build_one "$base_ver" "$base_ver" "$source_dir" modular "$target_arch"
     else
-      build_one "$base_ver" "$base_ver" "$source_dir" standard
-      build_one "$base_ver" "$base_ver" "$source_dir" modular
+      build_one "$base_ver" "$base_ver" "$source_dir" standard "$target_arch"
+      build_one "$base_ver" "$base_ver" "$source_dir" modular "$target_arch"
     fi
+    built_any=1
   done
+
+  if [[ "$built_any" -eq 0 ]]; then
+    for short_ver in "${KERNEL_SERIES[@]}"; do
+      source_dir=$(ensure_source_tree_for_series "$short_ver")
+      if [[ "$mode" == "standard" ]]; then
+        build_one "$short_ver" "$short_ver" "$source_dir" standard "$target_arch"
+      elif [[ "$mode" == "modular" ]]; then
+        build_one "$short_ver" "$short_ver" "$source_dir" modular "$target_arch"
+      else
+        build_one "$short_ver" "$short_ver" "$source_dir" standard "$target_arch"
+        build_one "$short_ver" "$short_ver" "$source_dir" modular "$target_arch"
+      fi
+    done
+  fi
 }
 
 main "$@"

@@ -11,40 +11,80 @@ declare -ar KERNEL_SERIES=(
   "6.18"
 )
 
+# Static versions are a fallback for offline builds. Online builds resolve the
+# latest active release for each series from kernel.org at runtime.
 declare -Ar KERNEL_VERSION_BY_SERIES=(
-  ["5.10"]="5.10.252"
-  ["5.15"]="5.15.202"
-  ["6.1"]="6.1.168"
-  ["6.6"]="6.6.134"
-  ["6.12"]="6.12.81"
-  ["6.18"]="6.18.22"
+  ["5.10"]="5.10.257"
+  ["5.15"]="5.15.208"
+  ["6.1"]="6.1.174"
+  ["6.6"]="6.6.141"
+  ["6.12"]="6.12.91"
+  ["6.18"]="6.18.33"
 )
 
-declare -Ar KERNEL_SOURCE_BY_SERIES=(
-  ["5.10"]="linux-5.10.252"
-  ["5.15"]="linux-5.15.202"
-  ["6.1"]="linux-6.1.168"
-  ["6.6"]="linux-6.6.134"
-  ["6.12"]="linux-6.12.81"
-  ["6.18"]="linux-6.18.22"
-)
+KERNEL_RELEASES_JSON_URL="${KERNEL_RELEASES_JSON_URL:-https://www.kernel.org/releases.json}"
+KERNEL_USE_ONLINE_LATEST="${KERNEL_USE_ONLINE_LATEST:-1}"
+KERNEL_RELEASES_JSON_CACHE=""
+declare -A KERNEL_RESOLVED_VERSION_BY_SERIES=()
 
 kernel_series_list() {
   printf '%s\n' "${KERNEL_SERIES[@]}"
 }
 
-kernel_source_name_for_series() {
+kernel_query_latest_version_for_series() {
   local series=$1
+  local latest
+  local releases_json
 
-  [[ -n ${KERNEL_SOURCE_BY_SERIES[$series]:-} ]] || return 1
-  printf '%s\n' "${KERNEL_SOURCE_BY_SERIES[$series]}"
+  [[ "$KERNEL_USE_ONLINE_LATEST" != 0 ]] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+
+  if [[ -z "$KERNEL_RELEASES_JSON_CACHE" ]]; then
+    KERNEL_RELEASES_JSON_CACHE="$(curl -fsSL --retry 3 --retry-delay 2 "$KERNEL_RELEASES_JSON_URL" 2>/dev/null)" || return 1
+  fi
+
+  releases_json=$KERNEL_RELEASES_JSON_CACHE
+  [[ -n "$releases_json" ]] || return 1
+
+  latest="$(
+    printf '%s\n' "$releases_json" \
+      | grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' \
+      | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/' \
+      | awk -v series="$series" 'index($0, series ".") == 1 { print }' \
+      | sort -V \
+      | tail -n 1
+  )"
+
+  [[ -n "$latest" ]] || return 1
+  printf '%s\n' "$latest"
 }
 
 kernel_full_version_for_series() {
   local series=$1
+  local version
+
+  if [[ -n ${KERNEL_RESOLVED_VERSION_BY_SERIES[$series]:-} ]]; then
+    printf '%s\n' "${KERNEL_RESOLVED_VERSION_BY_SERIES[$series]}"
+    return 0
+  fi
+
+  if version="$(kernel_query_latest_version_for_series "$series")"; then
+    KERNEL_RESOLVED_VERSION_BY_SERIES[$series]=$version
+    printf '%s\n' "$version"
+    return 0
+  fi
 
   [[ -n ${KERNEL_VERSION_BY_SERIES[$series]:-} ]] || return 1
+  KERNEL_RESOLVED_VERSION_BY_SERIES[$series]=${KERNEL_VERSION_BY_SERIES[$series]}
   printf '%s\n' "${KERNEL_VERSION_BY_SERIES[$series]}"
+}
+
+kernel_source_name_for_series() {
+  local series=$1
+  local version
+
+  version="$(kernel_full_version_for_series "$series")" || return 1
+  printf 'linux-%s\n' "$version"
 }
 
 kernel_version_sort_key() {

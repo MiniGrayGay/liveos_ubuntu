@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$ROOT_DIR/build/openssh-static"
-SRC_DIR="$BUILD_DIR/src"
+SRC_CACHE_DIR="$BUILD_DIR/src"
 OUT_DIR="$BUILD_DIR/out"
 ARTIFACT_DIR="$BUILD_DIR/artifacts"
 ROOTFS_DIR="$ROOT_DIR/rootfs"
@@ -24,47 +24,107 @@ JOBS="${JOBS:-$(nproc)}"
 SIZE_CFLAGS="${SIZE_CFLAGS:--Os -fomit-frame-pointer -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables}"
 SIZE_LDFLAGS="${SIZE_LDFLAGS:--static -Wl,--gc-sections}"
 
+NATIVE_CC="${NATIVE_CC:-musl-gcc}"
+NATIVE_STRIP="${NATIVE_STRIP:-strip}"
+AARCH64_CC="${AARCH64_CC:-aarch64-linux-musl-gcc}"
+AARCH64_STRIP="${AARCH64_STRIP:-}"
+AARCH64_LINUX_HEADERS="${AARCH64_LINUX_HEADERS:-/usr/aarch64-linux-gnu/include}"
+
+have_tool() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+install_package() {
+  local package=$1
+
+  if ! have_tool pacman; then
+    return 1
+  fi
+
+  echo "Installing missing package: $package" >&2
+  pacman -Sy --needed --noconfirm "$package"
+}
+
 require_tool() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "Missing required tool: $1" >&2
+  local tool=$1
+  local package=${2:-$1}
+
+  if have_tool "$tool"; then
+    return 0
+  fi
+
+  install_package "$package" || true
+
+  if ! have_tool "$tool"; then
+    echo "Missing required tool: $tool" >&2
     exit 1
-  }
+  fi
 }
 
-musl_static_link_works() {
-  local extra_ldflags=$1
-  local test_dir=$2
-  local test_c="$test_dir/conftest.c"
-  local test_bin="$test_dir/conftest"
+select_strip() {
+  local cc=$1
 
-  printf 'int main(void) { return 0; }\n' >"$test_c"
-
-  # SIZE_CFLAGS/SIZE_LDFLAGS are shell-style flag lists by design.
-  # shellcheck disable=SC2086
-  musl-gcc $SIZE_CFLAGS $SIZE_LDFLAGS $extra_ldflags "$test_c" -o "$test_bin" >/dev/null 2>&1
+  case "$cc" in
+    aarch64-linux-musl-gcc)
+      if [[ -n "$AARCH64_STRIP" ]]; then
+        printf '%s\n' "$AARCH64_STRIP"
+      elif have_tool aarch64-linux-musl-strip; then
+        printf '%s\n' "aarch64-linux-musl-strip"
+      elif have_tool aarch64-linux-gnu-strip; then
+        printf '%s\n' "aarch64-linux-gnu-strip"
+      else
+        printf '%s\n' "strip"
+      fi
+      ;;
+    *)
+      printf '%s\n' "$NATIVE_STRIP"
+      ;;
+  esac
 }
 
-fix_musl_static_link_flags() {
-  local test_dir
+host_triplet_for_cc() {
+  local cc=$1
 
-  test_dir=$(mktemp -d "${TMPDIR:-/tmp}/sftp-musl-link.XXXXXX")
+  case "$cc" in
+    aarch64-linux-musl-gcc) printf '%s\n' "aarch64-linux-musl" ;;
+    aarch64-linux-gnu-gcc) printf '%s\n' "aarch64-linux-gnu" ;;
+    *) printf '%s\n' "" ;;
+  esac
+}
 
-  if musl_static_link_works "" "$test_dir"; then
-    rm -rf "$test_dir"
-    return 0
+openssl_target_for_cc() {
+  local cc=$1
+
+  case "$cc" in
+    aarch64-*) printf '%s\n' "linux-aarch64" ;;
+    *) printf '%s\n' "linux-x86_64" ;;
+  esac
+}
+
+prepare_aarch64_musl_uapi_overlay() {
+  local overlay="$BUILD_DIR/aarch64-musl-uapi"
+
+  if [[ ! -d "$AARCH64_LINUX_HEADERS/linux" || ! -d "$AARCH64_LINUX_HEADERS/asm" ]]; then
+    install_package aarch64-linux-gnu-linux-api-headers || true
   fi
 
-  if musl_static_link_works "-fno-link-libatomic" "$test_dir"; then
-    SIZE_LDFLAGS="$SIZE_LDFLAGS -fno-link-libatomic"
-    echo "Added -fno-link-libatomic for musl-gcc static linking"
-    rm -rf "$test_dir"
-    return 0
+  if [[ ! -d "$AARCH64_LINUX_HEADERS/linux" || ! -d "$AARCH64_LINUX_HEADERS/asm" ]]; then
+    echo "Missing aarch64 Linux UAPI headers under $AARCH64_LINUX_HEADERS" >&2
+    exit 1
   fi
 
-  rm -rf "$test_dir"
-  echo "musl-gcc cannot create a static executable with the configured flags" >&2
-  echo "Try running: musl-gcc $SIZE_CFLAGS $SIZE_LDFLAGS /tmp/conftest.c -o /tmp/conftest" >&2
-  return 1
+  mkdir -p "$overlay"
+  local uapi_dirs=(
+    asm asm-generic cxl drm fwctl linux misc mtd nfs rdma regulator sound video xen
+  )
+  local dir
+  for dir in "${uapi_dirs[@]}"; do
+    if [[ -d "$AARCH64_LINUX_HEADERS/$dir" ]]; then
+      ln -sfn "$AARCH64_LINUX_HEADERS/$dir" "$overlay/$dir"
+    fi
+  done
+
+  printf '%s\n' "$overlay"
 }
 
 fetch() {
@@ -85,104 +145,194 @@ unpack() {
   tar -xf "$tarball" -C "$dest_dir" --strip-components=1
 }
 
+static_link_works() {
+  local cc=$1
+  local cflags=$2
+  local ldflags=$3
+  local extra_ldflags=$4
+  local test_dir=$5
+  local test_c="$test_dir/conftest.c"
+  local test_bin="$test_dir/conftest"
+
+  printf 'int main(void) { return 0; }\n' >"$test_c"
+
+  # SIZE_CFLAGS/SIZE_LDFLAGS are shell-style flag lists by design.
+  # shellcheck disable=SC2086
+  "$cc" $cflags $ldflags $extra_ldflags "$test_c" -o "$test_bin" >/dev/null 2>&1
+}
+
+resolve_static_ldflags() {
+  local target=$1
+  local cc=$2
+  local cflags=$3
+  local test_dir
+
+  test_dir=$(mktemp -d "${TMPDIR:-/tmp}/sftp-${target}-link.XXXXXX")
+
+  if static_link_works "$cc" "$cflags" "$SIZE_LDFLAGS" "" "$test_dir"; then
+    rm -rf "$test_dir"
+    printf '%s\n' "$SIZE_LDFLAGS"
+    return 0
+  fi
+
+  if static_link_works "$cc" "$cflags" "$SIZE_LDFLAGS" "-fno-link-libatomic" "$test_dir"; then
+    rm -rf "$test_dir"
+    echo "Added -fno-link-libatomic for $target static linking" >&2
+    printf '%s\n' "$SIZE_LDFLAGS -fno-link-libatomic"
+    return 0
+  fi
+
+  rm -rf "$test_dir"
+  echo "$cc cannot create a static executable with the configured flags" >&2
+  return 1
+}
+
+build_target() {
+  local target=$1
+  local output_name=$2
+  local cc=$3
+  local strip_tool=$4
+  local install_native_rootfs=$5
+  local host_triplet
+  local openssl_target
+  local configure_host=()
+  local src_base="$BUILD_DIR/$target"
+  local out_base="$OUT_DIR/$target"
+  local zlib_src="$src_base/zlib-src"
+  local openssl_src="$src_base/openssl-src"
+  local openssh_src="$src_base/openssh-src"
+  local zlib_prefix="$out_base/zlib"
+  local openssl_prefix="$out_base/openssl"
+  local openssl_lib_dir
+  local cflags="$SIZE_CFLAGS"
+  local ldflags
+  local ar_tool=ar
+  local ranlib_tool=ranlib
+
+  require_tool "$cc"
+  require_tool "$strip_tool"
+
+  host_triplet=$(host_triplet_for_cc "$cc")
+  openssl_target=$(openssl_target_for_cc "$cc")
+  if [[ -n "$host_triplet" ]]; then
+    configure_host=(--host="$host_triplet")
+  fi
+
+  if [[ "$target" == "aarch64" && "$cc" == "aarch64-linux-musl-gcc" ]]; then
+    cflags="$cflags -isystem $(prepare_aarch64_musl_uapi_overlay)"
+  fi
+
+  ldflags=$(resolve_static_ldflags "$target" "$cc" "$cflags")
+
+  rm -rf "$src_base" "$out_base"
+  mkdir -p "$src_base" "$out_base"
+  unpack "$SRC_CACHE_DIR/$ZLIB_TARBALL" "$zlib_src"
+  unpack "$SRC_CACHE_DIR/$OPENSSL_TARBALL" "$openssl_src"
+  unpack "$SRC_CACHE_DIR/$OPENSSH_TARBALL" "$openssh_src"
+
+  pushd "$zlib_src" >/dev/null
+  make distclean >/dev/null 2>&1 || true
+  CC="$cc" \
+  CFLAGS="$cflags" \
+  LDFLAGS="$ldflags" \
+  ./configure --static --prefix="$zlib_prefix"
+  make -j"$JOBS"
+  make install
+  popd >/dev/null
+
+  pushd "$openssl_src" >/dev/null
+  make distclean >/dev/null 2>&1 || true
+  CC="$cc" \
+  AR="$ar_tool" \
+  RANLIB="$ranlib_tool" \
+  CFLAGS="$cflags" \
+  LDFLAGS="$ldflags" \
+  ./Configure \
+    "$openssl_target" \
+    no-shared \
+    no-tests \
+    no-docs \
+    no-module \
+    no-async \
+    no-engine \
+    no-comp \
+    no-secure-memory \
+    --prefix="$openssl_prefix" \
+    --openssldir="$openssl_prefix/ssl"
+  make -j"$JOBS"
+  make install_sw
+  popd >/dev/null
+
+  openssl_lib_dir="$openssl_prefix/lib"
+  if [[ -d "$openssl_prefix/lib64" && -f "$openssl_prefix/lib64/libcrypto.a" ]]; then
+    openssl_lib_dir="$openssl_prefix/lib64"
+  fi
+
+  pushd "$openssh_src" >/dev/null
+  make distclean >/dev/null 2>&1 || true
+
+  CC="$cc" \
+  CFLAGS="$cflags" \
+  CPPFLAGS="-I$zlib_prefix/include -I$openssl_prefix/include" \
+  LDFLAGS="$ldflags -L$zlib_prefix/lib -L$openssl_lib_dir" \
+  LIBS="$openssl_lib_dir/libcrypto.a $zlib_prefix/lib/libz.a -lcrypt -lutil -lresolv" \
+  ./configure \
+    "${configure_host[@]}" \
+    --prefix=/usr \
+    --sysconfdir=/etc/ssh \
+    --libexecdir=/usr/lib/openssh \
+    --with-privsep-path=/var/empty \
+    --without-pam \
+    --without-kerberos5 \
+    --without-libedit \
+    --without-security-key-builtin \
+    --without-zlib-version-check \
+    --disable-strip
+
+  make -j"$JOBS" sftp-server
+  "$strip_tool" -s sftp-server
+  popd >/dev/null
+
+  install -Dm755 "$openssh_src/sftp-server" "$ARTIFACT_DIR/$output_name"
+  install -Dm755 "$openssh_src/sftp-server" "$ROOT_DIR/$output_name"
+
+  if [[ "$install_native_rootfs" == "yes" ]]; then
+    install -Dm755 "$openssh_src/sftp-server" "$ROOTFS_DIR/usr/lib/openssh/sftp-server"
+
+    mkdir -p "$ROOTFS_DIR/usr/local/crosware/software/dropbear/current/libexec"
+    ln -sfn /usr/lib/openssh/sftp-server \
+      "$ROOTFS_DIR/usr/local/crosware/software/dropbear/current/libexec/sftp-server"
+  fi
+
+  echo
+  echo "Built static $output_name:"
+  file "$ARTIFACT_DIR/$output_name"
+  ls -lh "$ARTIFACT_DIR/$output_name"
+  echo "ELF interpreter entries:"
+  readelf -l "$ARTIFACT_DIR/$output_name" | grep -F INTERP || echo "  none"
+}
+
 require_tool curl
 require_tool tar
 require_tool make
-require_tool musl-gcc
-require_tool strip
-require_tool mktemp
+require_tool readelf binutils
+require_tool mktemp coreutils
+require_tool "$NATIVE_CC" musl
+require_tool "$NATIVE_STRIP" binutils
+require_tool "$AARCH64_CC" musl-aarch64
 
-fix_musl_static_link_flags
-
-mkdir -p "$SRC_DIR" "$OUT_DIR" "$ARTIFACT_DIR"
-
-fetch "$OPENSSH_URL" "$SRC_DIR/$OPENSSH_TARBALL"
-fetch "$OPENSSL_URL" "$SRC_DIR/$OPENSSL_TARBALL"
-fetch "$ZLIB_URL" "$SRC_DIR/$ZLIB_TARBALL"
-
-ZLIB_SRC="$BUILD_DIR/zlib-src"
-OPENSSL_SRC="$BUILD_DIR/openssl-src"
-OPENSSH_SRC="$BUILD_DIR/openssh-src"
-
-unpack "$SRC_DIR/$ZLIB_TARBALL" "$ZLIB_SRC"
-unpack "$SRC_DIR/$OPENSSL_TARBALL" "$OPENSSL_SRC"
-unpack "$SRC_DIR/$OPENSSH_TARBALL" "$OPENSSH_SRC"
-
-rm -rf "$OUT_DIR/zlib" "$OUT_DIR/openssl" "$OUT_DIR/openssh"
-mkdir -p "$OUT_DIR/zlib" "$OUT_DIR/openssl" "$OUT_DIR/openssh"
-
-pushd "$ZLIB_SRC" >/dev/null
-make distclean >/dev/null 2>&1 || true
-CC=musl-gcc \
-CFLAGS="$SIZE_CFLAGS" \
-LDFLAGS="$SIZE_LDFLAGS" \
-./configure --static --prefix="$OUT_DIR/zlib"
-make -j"$JOBS"
-make install
-popd >/dev/null
-
-OPENSSL_PREFIX="$OUT_DIR/openssl"
-OPENSSL_LIB_DIR="$OPENSSL_PREFIX/lib"
-
-pushd "$OPENSSL_SRC" >/dev/null
-make distclean >/dev/null 2>&1 || true
-CC=musl-gcc \
-AR=ar \
-RANLIB=ranlib \
-CFLAGS="$SIZE_CFLAGS" \
-LDFLAGS="$SIZE_LDFLAGS" \
-./Configure \
-  linux-x86_64 \
-  no-shared \
-  no-tests \
-  no-docs \
-  no-module \
-  no-async \
-  no-engine \
-  no-comp \
-  no-secure-memory \
-  --prefix="$OPENSSL_PREFIX" \
-  --openssldir="$OPENSSL_PREFIX/ssl"
-make -j"$JOBS"
-make install_sw
-popd >/dev/null
-
-if [[ -d "$OPENSSL_PREFIX/lib64" && -f "$OPENSSL_PREFIX/lib64/libcrypto.a" ]]; then
-  OPENSSL_LIB_DIR="$OPENSSL_PREFIX/lib64"
+AARCH64_STRIP="$(select_strip "$AARCH64_CC")"
+if [[ "$AARCH64_STRIP" == aarch64-linux-gnu-strip ]]; then
+  require_tool "$AARCH64_STRIP" aarch64-linux-gnu-binutils
+else
+  require_tool "$AARCH64_STRIP" binutils
 fi
 
-pushd "$OPENSSH_SRC" >/dev/null
-make distclean >/dev/null 2>&1 || true
+mkdir -p "$SRC_CACHE_DIR" "$OUT_DIR" "$ARTIFACT_DIR"
 
-export CC=musl-gcc
-export CFLAGS="$SIZE_CFLAGS"
-export CPPFLAGS="-I$OUT_DIR/zlib/include -I$OPENSSL_PREFIX/include"
-export LDFLAGS="$SIZE_LDFLAGS -L$OUT_DIR/zlib/lib -L$OPENSSL_LIB_DIR"
-export LIBS="$OPENSSL_LIB_DIR/libcrypto.a $OUT_DIR/zlib/lib/libz.a -lcrypt -lutil -lresolv"
+fetch "$OPENSSH_URL" "$SRC_CACHE_DIR/$OPENSSH_TARBALL"
+fetch "$OPENSSL_URL" "$SRC_CACHE_DIR/$OPENSSL_TARBALL"
+fetch "$ZLIB_URL" "$SRC_CACHE_DIR/$ZLIB_TARBALL"
 
-./configure \
-  --prefix=/usr \
-  --sysconfdir=/etc/ssh \
-  --libexecdir=/usr/lib/openssh \
-  --with-privsep-path=/var/empty \
-  --without-pam \
-  --without-kerberos5 \
-  --without-libedit \
-  --without-security-key-builtin \
-  --without-zlib-version-check \
-  --disable-strip
-
-make -j"$JOBS" sftp-server
-strip -s sftp-server
-popd >/dev/null
-
-install -Dm755 "$OPENSSH_SRC/sftp-server" "$ARTIFACT_DIR/sftp-server"
-install -Dm755 "$OPENSSH_SRC/sftp-server" "$ROOTFS_DIR/usr/lib/openssh/sftp-server"
-
-mkdir -p "$ROOTFS_DIR/usr/local/crosware/software/dropbear/current/libexec"
-ln -sfn /usr/lib/openssh/sftp-server \
-  "$ROOTFS_DIR/usr/local/crosware/software/dropbear/current/libexec/sftp-server"
-
-echo "Built static sftp-server:"
-file "$ARTIFACT_DIR/sftp-server"
-ls -lh "$ARTIFACT_DIR/sftp-server"
+build_target native sftp-server "$NATIVE_CC" "$NATIVE_STRIP" yes
+build_target aarch64 sftp-server_aarch64 "$AARCH64_CC" "$AARCH64_STRIP" no

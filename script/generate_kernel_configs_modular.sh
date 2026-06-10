@@ -22,47 +22,12 @@ require_tool() {
   command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"
 }
 
-force_builtin() {
+force_all_modules_builtin() {
   local cfg=$1
-  shift
   local tmp
+
   tmp="$(mktemp)"
-  awk -v symbols="$*" '
-    BEGIN {
-      split(symbols, items, " ");
-      for (i in items) {
-        if (items[i] != "") {
-          want[items[i]] = 1;
-        }
-      }
-    }
-    function symbol_name(line, out) {
-      out = line;
-      sub(/^# /, "", out);
-      sub(/^CONFIG_/, "", out);
-      sub(/=.*/, "", out);
-      sub(/ is not set$/, "", out);
-      return out;
-    }
-    {
-      symbol = symbol_name($0);
-      if (symbol in want) {
-        if (!(symbol in emitted)) {
-          print "CONFIG_" symbol "=y";
-          emitted[symbol] = 1;
-        }
-        next;
-      }
-      print;
-    }
-    END {
-      for (symbol in want) {
-        if (!(symbol in emitted)) {
-          print "CONFIG_" symbol "=y";
-        }
-      }
-    }
-  ' "$cfg" >"$tmp"
+  sed -E 's/=(m)$/=y/' "$cfg" >"$tmp"
   mv "$tmp" "$cfg"
 }
 
@@ -223,12 +188,8 @@ for version in "${KERNEL_SERIES[@]}"; do
 
   [ -x "$src/scripts/config" ] || die "missing scripts/config in $src"
 
-  if [[ -f "$seed_config" ]]; then
-    cp "$seed_config" "$cfg"
-  else
-    seed_config="$BASE_CONFIG"
-    cp "$BASE_CONFIG" "$cfg"
-  fi
+  [[ -f "$seed_config" ]] || die "standard config not found for $version: $seed_config; run generate_kernel_configs.sh first"
+  cp "$seed_config" "$cfg"
 
   sed -i \
     -e '/^CONFIG_BASE_SMALL=/d' \
@@ -239,163 +200,26 @@ for version in "${KERNEL_SERIES[@]}"; do
     "$src/scripts/config" --file "$cfg" "$@"
   }
 
-  # Keep the standard boot path intact while turning on real loadable modules.
-  # These target trees do not expose a standalone CONFIG_KMOD knob, so
-  # CONFIG_MODULES / CONFIG_MODULE_UNLOAD are the portable controls here.
+  # Keep the standard single-bzImage boot path intact while enabling only the
+  # kernel module subsystem used by lsmod, modprobe, insmod, and rmmod.
   kc --enable MODULES
   kc --enable MODULE_UNLOAD
   kc --disable MODULE_UNLOAD_TAINT_TRACKING
   kc --disable MODVERSIONS
-  kc --enable BLOCK
-  kc --enable HOTPLUG
-  kc --enable BLK_DEV_INITRD
-  kc --enable DEVTMPFS
-  kc --enable DEVTMPFS_MOUNT
-  kc --enable TMPFS
-  kc --enable TMPFS_POSIX_ACL
-  kc --enable UNIX
-  kc --enable INET
-  kc --enable PACKET
-  kc --enable NET
-  kc --enable PCI
-  kc --enable PCI_MSI
-  kc --enable EFI
-  kc --enable EFI_STUB
-  kc --enable EFI_PARTITION
-  kc --enable EFIVAR_FS
-  kc --enable SYSFB
-  kc --enable SYSFB_SIMPLEFB
-  kc --enable VT
-  kc --enable TTY
-  kc --enable SERIAL_8250
-  kc --enable SERIAL_8250_CONSOLE
-  kc --enable SERIAL_8250_PNP
-  kc --enable SERIAL_EARLYCON
-  kc --enable FB
-  kc --enable FB_EFI
-  kc --enable FB_VESA
-  kc --enable FB_SIMPLE
-  kc --enable FRAMEBUFFER_CONSOLE
-  kc --enable FRAMEBUFFER_CONSOLE_DETECT_PRIMARY
-  kc --enable FRAMEBUFFER_CONSOLE_ROTATION
-  kc --enable IP_PNP
-  kc --enable IP_PNP_DHCP
-  kc --enable IP_PNP_BOOTP
-  kc --disable IP_PNP_RARP
-  kc --enable ISCSI_BOOT_SYSFS
-  kc --enable FW_LOADER
-  kc --disable FIRMWARE_IN_KERNEL
-  kc --set-str EXTRA_FIRMWARE ""
-  kc --set-str EXTRA_FIRMWARE_DIR ""
-
-  # Keep the single kernel image format identical to the standard profile.
-  kc --enable KERNEL_XZ
-  kc --disable KERNEL_GZIP
-  kc --disable KERNEL_BZIP2
-  kc --disable KERNEL_LZMA
-  kc --disable KERNEL_LZO
-  kc --disable KERNEL_LZ4
-  kc --disable KERNEL_ZSTD
-  kc --enable RD_ZSTD
-  kc --disable RD_GZIP
-  kc --disable RD_BZIP2
-  kc --disable RD_LZMA
-  kc --disable RD_XZ
-  kc --disable RD_LZO
-  kc --disable RD_LZ4
-
-  # Core boot/storage/network coverage stays builtin so one bzImage can boot
-  # with arbitrary initrd contents, while richer runtime coverage stays modular.
-  force_builtin "$cfg" \
-    TTY VT SERIAL_8250 SERIAL_8250_CONSOLE SERIAL_8250_PNP SERIAL_EARLYCON \
-    FB FB_EFI FB_VESA FB_SIMPLE FRAMEBUFFER_CONSOLE \
-    FRAMEBUFFER_CONSOLE_DETECT_PRIMARY FRAMEBUFFER_CONSOLE_ROTATION \
-    ATA ATA_PIIX ATA_GENERIC SATA_AHCI SATA_AHCI_PLATFORM \
-    PATA_ACPI PATA_ALI PATA_AMD PATA_ARTOP PATA_ATIIXP PATA_CMD640_PCI \
-    PATA_CMD64X PATA_CS5520 PATA_CS5530 PATA_CS5535 PATA_CS5536 PATA_CYPRESS \
-    PATA_EFAR PATA_HPT366 PATA_HPT37X PATA_HPT3X2N PATA_HPT3X3 PATA_IT8213 \
-    PATA_IT821X PATA_JMICRON PATA_LEGACY PATA_MARVELL PATA_MPIIX PATA_NETCELL \
-    PATA_NINJA32 PATA_NS87410 PATA_NS87415 PATA_OLDPIIX PATA_OPTI \
-    PATA_PDC2027X PATA_PDC_OLD PATA_RDC PATA_RZ1000 PATA_SCH \
-    PATA_SERVERWORKS PATA_SIL680 PATA_SIS PATA_VIA PATA_WINBOND \
-    SCSI SCSI_MOD BLK_DEV_SD BLK_DEV_SR CHR_DEV_SG SCSI_VIRTIO \
-    BLK_DEV_NVME NVME_CORE USB USB_XHCI_HCD USB_EHCI_HCD USB_OHCI_HCD \
-    USB_UHCI_HCD USB_STORAGE USB_UAS VIRTIO VIRTIO_PCI VIRTIO_BLK \
-    XEN_BLKDEV_FRONTEND XEN_NETDEV_FRONTEND HYPERV_VMBUS HYPERV_STORAGE \
-    HYPERV_NET I2C HWMON PHYLIB PHYLINK SFP EXT2_FS EXT4_FS EXT4_USE_FOR_EXT2 \
-    ISO9660_FS MSDOS_FS VFAT_FS E1000 E1000E IGB R8169 TIGON3 VIRTIO_NET \
-    VMXNET3 REALTEK_PHY MOTORCOMM_PHY MARVELL_PHY
-
-  # Filesystems that are useful at runtime but not required for the generic
-  # initrd boot path become true loadable modules.
-  kc --module XFS_FS
-  kc --module BTRFS_FS
-  kc --module NILFS2_FS
-  kc --module F2FS_FS
-  kc --module UDF_FS
-  kc --module SQUASHFS
-  kc --module FUSE_FS
-  kc --module OVERLAY_FS
-  kc --module NFS_FS
-  kc --module CIFS
-
-  if [[ "$version" != "6.18" ]]; then
-    kc --module EXT3_FS
-    kc --module REISERFS_FS
-    kc --enable REISERFS_FS_XATTR
-    kc --enable REISERFS_FS_POSIX_ACL
-    kc --enable REISERFS_FS_SECURITY
-  else
-    kc --disable EXT3_FS
-    kc --disable REISERFS_FS
-  fi
-
-  if [[ "$version" == "5.10" ]]; then
-    kc --module NTFS_FS
-    kc --disable NTFS3_FS
-  else
-    kc --module NTFS3_FS
-    kc --disable NTFS_FS
-  fi
-
-  # Less common high-end NICs and USB LAN adapters stay modular.
-  kc --module IGBVF
-  kc --module IXGBE
-  kc --module IXGBEVF
-  kc --module IGC
-  kc --module BNX2
-  kc --module BNX2X
-  kc --module BNXT
-  kc --module ATL1E
-  kc --module ATL1C
-  kc --module AQTION
-  kc --module MLX4_EN
-  kc --module MLX5_CORE
-  kc --enable MLX5_CORE_EN
-  kc --module ENA_ETHERNET
-  kc --module USB_NET_DRIVERS
-  kc --module USB_USBNET
-  kc --module USB_RTL8152
-  kc --module USB_LAN78XX
-  kc --module USB_NET_AX8817X
-  kc --module USB_NET_AX88179_178A
-  kc --module USB_NET_AQC111
-  kc --module USB_NET_CDCETHER
-  kc --module USB_NET_CDC_EEM
-  kc --module USB_NET_CDC_NCM
-  kc --module USB_NET_CDC_MBIM
-
-  # Keep the richer runtime/debug surface from the old modular profile.
-  kc --enable KALLSYMS
-  kc --enable IKCONFIG
-  kc --enable IKCONFIG_PROC
-  kc --enable PERF_EVENTS
-  kc --enable BPF
-  kc --enable BPF_SYSCALL
-  kc --set-val SERIAL_8250_NR_UARTS 4
-  kc --set-val SERIAL_8250_RUNTIME_UARTS 4
+  kc --enable KMOD
 
   make -s -C "$src" O="$out" ARCH=x86 olddefconfig
+  for _ in 1 2 3; do
+    if ! grep -q '=m$' "$cfg"; then
+      break
+    fi
+    force_all_modules_builtin "$cfg"
+    make -s -C "$src" O="$out" ARCH=x86 olddefconfig
+  done
+  if grep -q '=m$' "$cfg"; then
+    grep '=m$' "$cfg" >&2
+    die "generated modular config for $version still contains loadable modules"
+  fi
   cp "$cfg" "$target"
   prepend_header "$target" "$version" "${VERSION_TO_REAL[$version]}" "$seed_config"
   chmod 0644 "$target"
@@ -404,9 +228,8 @@ done
 {
   printf '# Generated modular kernel configs\n\n'
   printf 'Base config: `%s`\n\n' "$BASE_CONFIG"
-  printf 'Profile: keep a single `bzImage` boot path aligned with the standard configs, while enabling real loadable module support via `CONFIG_MODULES` and `CONFIG_MODULE_UNLOAD`.\n\n'
-  printf 'Boot-critical framebuffer and console settings stay aligned with the standard profile, including `SYSFB_SIMPLEFB`, `FB_EFI`, `FB_VESA`, `FB_SIMPLE`, and `FRAMEBUFFER_CONSOLE`.\n\n'
-  printf 'Runtime-extensible coverage is emitted as modules for richer filesystems and less-common network adapters, so the modular outputs can use `modprobe`, `insmod`, and `rmmod` with an external module tree.\n\n'
+  printf 'Profile: derive directly from the standard configs and keep a single `bzImage` boot path, while enabling only the module syscalls needed by `lsmod`, `modprobe`, `insmod`, and `rmmod` via `CONFIG_MODULES` and `CONFIG_MODULE_UNLOAD`.\n\n'
+  printf 'No selected driver or filesystem is emitted as `=m`; generated configs are checked to ensure they do not require an external module tree.\n\n'
   printf '| Series | Real source | Output file |\n'
   printf '| --- | --- | --- |\n'
   for version in "${KERNEL_SERIES[@]}"; do
