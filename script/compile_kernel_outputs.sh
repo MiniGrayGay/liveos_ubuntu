@@ -406,6 +406,7 @@ main() {
   local detected_version
   local mode=both
   local short_ver
+  local config_ver
   local target_arch=x86_64
   local built_any=0
 
@@ -493,16 +494,27 @@ main() {
       exit 1
     }
     source_dir=$(ensure_source_tree_for_series "$base_ver")
+    detected_version=$(kernel_detect_version_from_name "$source_dir") || {
+      printf 'error: could not detect kernel version from source tree: %s\n' "$source_dir" >&2
+      exit 1
+    }
+    config_ver=$(kernel_find_best_series_for_version "$detected_version") || {
+      printf 'error: no usable config series found for source version %s\n' "$detected_version" >&2
+      exit 1
+    }
+    if [[ "$config_ver" != "$base_ver" ]]; then
+      printf '==> Using nearest config series %s for kernel %s\n' "$config_ver" "$detected_version" >&2
+    fi
 
     if [[ "$flavor" == "modular" ]]; then
-      build_one "$base_ver" "$base_ver" "$source_dir" modular "$target_arch"
+      build_one "$base_ver" "$config_ver" "$source_dir" modular "$target_arch"
     elif [[ "$mode" == "standard" ]]; then
-      build_one "$base_ver" "$base_ver" "$source_dir" standard "$target_arch"
+      build_one "$base_ver" "$config_ver" "$source_dir" standard "$target_arch"
     elif [[ "$mode" == "modular" ]]; then
-      build_one "$base_ver" "$base_ver" "$source_dir" modular "$target_arch"
+      build_one "$base_ver" "$config_ver" "$source_dir" modular "$target_arch"
     else
-      build_one "$base_ver" "$base_ver" "$source_dir" standard "$target_arch"
-      build_one "$base_ver" "$base_ver" "$source_dir" modular "$target_arch"
+      build_one "$base_ver" "$config_ver" "$source_dir" standard "$target_arch"
+      build_one "$base_ver" "$config_ver" "$source_dir" modular "$target_arch"
     fi
     built_any=1
   done

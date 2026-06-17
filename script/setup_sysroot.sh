@@ -2,8 +2,6 @@
 
 set -euo pipefail
 
-echo "Setting up sysroot for initramfs"
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SYSROOT_DIR="$ROOT_DIR/sysroot"
 ETC_DIR="$SYSROOT_DIR/etc"
@@ -14,6 +12,7 @@ ROOT_PASSWORD='123@@@'
 DEFAULT_USER=ubuntu
 DEFAULT_USER_PASSWORD=ubuntu
 RESET_SYSROOT_MODE=ask
+STRIP_SYSROOT_COMMENTS=no
 UBUNTU_BASE_TARBALL="${UBUNTU_BASE_TARBALL:-}"
 REINSTALL_SCRIPT_URL="${REINSTALL_SCRIPT_URL:-https://cnb.cool/bin456789/reinstall/-/git/raw/main/reinstall.sh}"
 
@@ -23,8 +22,16 @@ die() {
 }
 
 usage() {
-  echo "Usage: $0 [-y|-n]" >&2
-  exit 1
+  cat >&2 <<EOF
+Usage: $0 [-y|-n] [--strip-comments]
+
+Options:
+  -y, --yes             Delete existing sysroot/ without prompting
+  -n, --no              Keep existing sysroot/ and configure it in place
+      --strip-comments  Remove comments from shell scripts and config files in sysroot/
+  -h, --help            Show this help
+EOF
+  exit "${1:-1}"
 }
 
 mount_if_needed() {
@@ -79,6 +86,393 @@ cleanup_dir_contents() {
   mkdir -p "$dir"
   find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
   echo "Cleaned $dir"
+}
+
+is_text_file() {
+  local file_path=$1
+
+  [ ! -s "$file_path" ] || LC_ALL=C grep -Iq . "$file_path"
+}
+
+has_shell_shebang() {
+  local file_path=$1
+  local first_line
+
+  IFS= read -r first_line <"$file_path" || return 1
+  case "$first_line" in
+    '#!'*'/sh'*|'#!'*'/bash'*|'#!'*'/dash'*|'#!'*'/ksh'*|'#!'*'/zsh'*|'#!'*'env sh'*|'#!'*'env bash'*|'#!'*'env dash'*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+is_shell_script_path() {
+  local file_path=$1
+  local rel_path=${file_path#"$SYSROOT_DIR"/}
+  local base_name=${file_path##*/}
+
+  case "$base_name" in
+    *.sh|*.bash|*.bashrc|.bash_profile|.bash_login|.bash_logout|.profile|profile)
+      return 0
+      ;;
+  esac
+
+  case "$rel_path" in
+    etc/init.d/*|etc/cron.*/*|etc/profile.d/*|etc/update-motd.d/*|usr/lib/*/profile.d/*|usr/share/dpkg/sh/*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+is_config_path() {
+  local file_path=$1
+  local rel_path=${file_path#"$SYSROOT_DIR"/}
+  local base_name=${file_path##*/}
+
+  case "$rel_path" in
+    etc/*|usr/lib/systemd/*|usr/lib/sysctl.d/*|usr/lib/modprobe.d/*|usr/lib/sysusers.d/*|usr/lib/tmpfiles.d/*|usr/lib/udev/rules.d/*|usr/share/dbus-1/*|usr/share/factory/etc/*)
+      return 0
+      ;;
+  esac
+
+  case "$base_name" in
+    *.conf|*.cfg|*.cnf|*.ini|*.list|*.sources|*.service|*.socket|*.target|*.timer|*.mount|*.path|*.slice|*.automount|*.rules)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+copy_file_metadata() {
+  local source=$1
+  local target=$2
+
+  chmod --reference="$source" "$target" 2>/dev/null || true
+  chown --reference="$source" "$target" 2>/dev/null || true
+  touch -r "$source" "$target" 2>/dev/null || true
+}
+
+rewrite_file_if_changed() {
+  local file_path=$1
+  local tmp_path=$2
+
+  copy_file_metadata "$file_path" "$tmp_path"
+  if cmp -s "$file_path" "$tmp_path"; then
+    rm -f "$tmp_path"
+    return 1
+  fi
+
+  mv -f "$tmp_path" "$file_path"
+  return 0
+}
+
+strip_shell_comments() {
+  local file_path=$1
+  local tmp_path
+
+  is_text_file "$file_path" || return 1
+  tmp_path="$(mktemp "$(dirname "$file_path")/.${file_path##*/}.strip-comments.XXXXXX")" || return 2
+
+  if ! awk '
+    BEGIN {
+      squote = sprintf("%c", 39)
+      heredoc_count = 0
+    }
+
+    function previous_starts_comment(prev) {
+      return prev == "" || prev ~ /[[:space:]]/ || prev ~ /[;&|()<>]/
+    }
+
+    function strip_hash_comment(line,    i, c, prev, prefix, quote, escaped) {
+      quote = ""
+      escaped = 0
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+
+        if (escaped) {
+          escaped = 0
+          continue
+        }
+
+        if (quote == squote) {
+          if (c == squote) {
+            quote = ""
+          }
+          continue
+        }
+
+        if (quote == "\"") {
+          if (c == "\\") {
+            escaped = 1
+            continue
+          }
+          if (c == "\"") {
+            quote = ""
+          }
+          continue
+        }
+
+        if (c == "\\") {
+          escaped = 1
+          continue
+        }
+        if (c == squote) {
+          quote = squote
+          continue
+        }
+        if (c == "\"") {
+          quote = "\""
+          continue
+        }
+        if (c == "#") {
+          prev = i == 1 ? "" : substr(line, i - 1, 1)
+          if (previous_starts_comment(prev)) {
+            prefix = substr(line, 1, i - 1)
+            sub(/[[:space:]]+$/, "", prefix)
+            return prefix
+          }
+        }
+      }
+      return line
+    }
+
+    function queue_heredocs(line,    rest, q, endq, delim) {
+      rest = line
+      while (match(rest, /<<-?[[:space:]]*/)) {
+        rest = substr(rest, RSTART + RLENGTH)
+        q = substr(rest, 1, 1)
+
+        if (q == squote || q == "\"") {
+          rest = substr(rest, 2)
+          endq = index(rest, q)
+          if (!endq) {
+            break
+          }
+          delim = substr(rest, 1, endq - 1)
+          rest = substr(rest, endq + 1)
+        } else {
+          if (q == "\\") {
+            rest = substr(rest, 2)
+          }
+          if (!match(rest, /^[A-Za-z0-9_.:-]+/)) {
+            break
+          }
+          delim = substr(rest, RSTART, RLENGTH)
+          rest = substr(rest, RLENGTH + 1)
+        }
+
+        if (delim != "") {
+          heredocs[++heredoc_count] = delim
+        }
+      }
+    }
+
+    function shift_heredocs(    i) {
+      for (i = 1; i < heredoc_count; i++) {
+        heredocs[i] = heredocs[i + 1]
+      }
+      delete heredocs[heredoc_count]
+      heredoc_count--
+    }
+
+    NR == 1 && /^#!/ {
+      print
+      next
+    }
+
+    heredoc_count > 0 {
+      print
+      marker = $0
+      sub(/^\t+/, "", marker)
+      if (marker == heredocs[1]) {
+        shift_heredocs()
+      }
+      next
+    }
+
+    {
+      stripped = strip_hash_comment($0)
+      if (stripped != "") {
+        print stripped
+        queue_heredocs(stripped)
+      }
+    }
+  ' "$file_path" >"$tmp_path"; then
+    rm -f "$tmp_path"
+    return 2
+  fi
+
+  rewrite_file_if_changed "$file_path" "$tmp_path"
+}
+
+strip_config_comments() {
+  local file_path=$1
+  local tmp_path
+
+  is_text_file "$file_path" || return 1
+  tmp_path="$(mktemp "$(dirname "$file_path")/.${file_path##*/}.strip-comments.XXXXXX")" || return 2
+
+  if ! awk '
+    BEGIN {
+      squote = sprintf("%c", 39)
+      xml_comment = 0
+    }
+
+    function previous_starts_comment(prev) {
+      return prev == "" || prev ~ /[[:space:]]/
+    }
+
+    function remove_xml_comments(line,    start, stop, prefix, suffix) {
+      while (xml_comment || match(line, /<!--/)) {
+        if (xml_comment) {
+          stop = index(line, "-->")
+          if (!stop) {
+            return ""
+          }
+          line = substr(line, stop + 3)
+          xml_comment = 0
+          continue
+        }
+
+        start = RSTART
+        prefix = substr(line, 1, start - 1)
+        suffix = substr(line, start)
+
+        stop = index(suffix, "-->")
+        if (!stop) {
+          xml_comment = 1
+          return prefix
+        }
+        line = prefix substr(suffix, stop + 3)
+      }
+
+      return line
+    }
+
+    function strip_hash_comment(line,    i, c, prev, prefix, quote, escaped) {
+      quote = ""
+      escaped = 0
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+
+        if (escaped) {
+          escaped = 0
+          continue
+        }
+
+        if (quote == squote) {
+          if (c == squote) {
+            quote = ""
+          }
+          continue
+        }
+
+        if (quote == "\"") {
+          if (c == "\\") {
+            escaped = 1
+            continue
+          }
+          if (c == "\"") {
+            quote = ""
+          }
+          continue
+        }
+
+        if (c == "\\") {
+          escaped = 1
+          continue
+        }
+        if (c == squote) {
+          quote = squote
+          continue
+        }
+        if (c == "\"") {
+          quote = "\""
+          continue
+        }
+        if (c == "#") {
+          prev = i == 1 ? "" : substr(line, i - 1, 1)
+          if (previous_starts_comment(prev)) {
+            prefix = substr(line, 1, i - 1)
+            sub(/[[:space:]]+$/, "", prefix)
+            return prefix
+          }
+        }
+      }
+      return line
+    }
+
+    {
+      line = remove_xml_comments($0)
+      trimmed = line
+      sub(/^[[:space:]]+/, "", trimmed)
+      if (trimmed ~ /^(#|;)/ || trimmed == "") {
+        next
+      }
+      line = strip_hash_comment(line)
+      if (line != "") {
+        print line
+      }
+    }
+  ' "$file_path" >"$tmp_path"; then
+    rm -f "$tmp_path"
+    return 2
+  fi
+
+  rewrite_file_if_changed "$file_path" "$tmp_path"
+}
+
+find_sysroot_files() {
+  find "$SYSROOT_DIR" \
+    \( -path "$SYSROOT_DIR/proc" -o -path "$SYSROOT_DIR/sys" -o -path "$SYSROOT_DIR/dev" -o -path "$SYSROOT_DIR/run" \) -prune \
+    -o -type f -print0
+}
+
+strip_sysroot_comments() {
+  local -A shell_files=()
+  local file_path
+  local shell_total=0
+  local shell_changed=0
+  local config_total=0
+  local config_changed=0
+  local status
+
+  echo "Stripping comments from sysroot shell scripts and config files"
+
+  while IFS= read -r -d '' file_path; do
+    if is_shell_script_path "$file_path" || has_shell_shebang "$file_path"; then
+      shell_files["$file_path"]=1
+      shell_total=$((shell_total + 1))
+      if strip_shell_comments "$file_path"; then
+        shell_changed=$((shell_changed + 1))
+      else
+        status=$?
+        [ "$status" -eq 1 ] || return "$status"
+      fi
+    fi
+  done < <(find_sysroot_files)
+
+  while IFS= read -r -d '' file_path; do
+    if [ "${shell_files[$file_path]+set}" = set ]; then
+      continue
+    fi
+    is_config_path "$file_path" || continue
+    config_total=$((config_total + 1))
+    if strip_config_comments "$file_path"; then
+      config_changed=$((config_changed + 1))
+    else
+      status=$?
+      [ "$status" -eq 1 ] || return "$status"
+    fi
+  done < <(find_sysroot_files)
+
+  echo "Shell scripts changed: $shell_changed/$shell_total"
+  echo "Config files changed: $config_changed/$config_total"
 }
 
 write_download_reinstall_script() {
@@ -274,24 +668,36 @@ prepare_base_sysroot() {
   extract_ubuntu_base "$tarball"
 }
 
-while getopts ':yn' opt; do
-  case "$opt" in
-    y)
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -y|--yes)
       [ "$RESET_SYSROOT_MODE" = ask ] || usage
       RESET_SYSROOT_MODE=yes
       ;;
-    n)
+    -n|--no)
       [ "$RESET_SYSROOT_MODE" = ask ] || usage
       RESET_SYSROOT_MODE=no
+      ;;
+    --strip-comments)
+      STRIP_SYSROOT_COMMENTS=yes
+      ;;
+    -h|--help)
+      usage 0
+      ;;
+    --)
+      shift
+      break
       ;;
     *)
       usage
       ;;
   esac
+  shift
 done
 
-shift $((OPTIND - 1))
 [ "$#" -eq 0 ] || usage
+
+echo "Setting up sysroot for initramfs"
 
 prepare_base_sysroot
 
@@ -585,3 +991,7 @@ umount_if_mounted "$SYSROOT_DIR/run"
 umount_if_mounted "$SYSROOT_DIR/dev"
 umount_if_mounted "$SYSROOT_DIR/sys"
 umount_if_mounted "$SYSROOT_DIR/proc"
+
+if [ "$STRIP_SYSROOT_COMMENTS" = yes ]; then
+  strip_sysroot_comments
+fi

@@ -93,6 +93,7 @@ help: ## Show available targets
 	@printf "  make kernel KERNEL=7.0.10\n"
 	@printf "  make sysroot\n"
 	@printf "  make sysroot 24.04.4\n"
+	@printf "  make sysroot SETUP_FLAGS=\"-y --strip-comments\"\n"
 	@printf "  make iso\n"
 
 scripts: ## List project scripts

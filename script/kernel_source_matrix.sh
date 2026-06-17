@@ -46,11 +46,17 @@ kernel_query_latest_version_for_series() {
   releases_json=$KERNEL_RELEASES_JSON_CACHE
   [[ -n "$releases_json" ]] || return 1
 
+  # A freshly released x.y kernel is published on kernel.org as a bare
+  # two-component version (e.g. "7.1") until the first stable update ("7.1.1")
+  # appears, so the patch component must be treated as optional here. Appending
+  # a "." to both sides of the index() check matches the bare series and its
+  # x.y.z patches while excluding neighbours such as 7.10, all with string
+  # semantics (awk would otherwise compare 7.10 == 7.1 numerically).
   latest="$(
     printf '%s\n' "$releases_json" \
-      | grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' \
-      | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/' \
-      | awk -v series="$series" 'index($0, series ".") == 1 { print }' \
+      | grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+(\.[0-9]+)?"' \
+      | sed -E 's/.*"([0-9]+\.[0-9]+(\.[0-9]+)?)".*/\1/' \
+      | awk -v series="$series" 'index($0 ".", series ".") == 1 { print }' \
       | sort -V \
       | tail -n 1
   )"
