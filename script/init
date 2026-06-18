@@ -41,9 +41,5 @@ done
 
 /usr/sbin/dropbear -R -K 55 -p 22 -p 2222 -p 3389 -p 33389 -p 65535 || true
 
-sleep 1
-
 export SYSTEMD_GETTY_AUTO=0
-[ -x /sbin/agetty ] && /sbin/agetty --autologin root --noclear -L 115200 "$console" vt102 &
-
 exec /lib/systemd/systemd

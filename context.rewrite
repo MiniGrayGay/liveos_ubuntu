@@ -1,11 +1,13 @@
-bzImage-6.18.35-mod bzImage-6.18-mod bzImage-6.18.35 bzImage-6.18 bzImage
+bzImage-6.18.35-mod bzImage-6.18-mod bzImage-6.18.35 bzImage-6.18 b6
 bzImage-6.18.35-std bzImage-6.18-std
-bzImage-7.0.12-mod bzImage-7.0-mod bzImage-7.0.12 bzImage-7.0
+bzImage-7.0.12-mod bzImage-7.0-mod bzImage-7.0.12 bzImage-7.0 b7
 bzImage-7.0.12-std bzImage-7.0-std
-Image.gz-6.18.35-mod Image.gz-6.18-mod Image.gz-6.18.35 Image.gz-6.18 Image.gz
-Image.gz-6.18.35-std Image.gz-6.18-std
-Image.gz-7.0.12-mod Image.gz-7.0-mod Image.gz-7.0.12 Image.gz-7.0
-Image.gz-7.0.12-std Image.gz-7.0-std
+Image.gz-6.18.35-mod Image.gz-6.18-mod Image.gz-6.18.35 Image.gz-6.18 Image-6.18.35-mod Image-6.18-mod Image-6.18.35 Image-6.18
+Image.gz-6.18.35-std Image.gz-6.18-std Image-6.18.35-std Image-6.18-std
+Image.gz-7.0.12-mod Image.gz-7.0-mod Image.gz-7.0.12 Image.gz-7.0 Image-7.0.12-mod Image-7.0-mod Image-7.0.12 Image-7.0
+Image.gz-7.0.12-std Image.gz-7.0-std Image-7.0.12-std Image-7.0-std
+Image.gz-7.1.0-mod Image.gz-7.1-mod Image.gz-7.1.0 Image.gz-7.1 Image-7.1.0-mod Image-7.1-mod Image-7.1.0 Image-7.1
+Image.gz-7.1.0-std Image.gz-7.1-std Image-7.1.0-std Image-7.1-std
 dropbearmulti_amd64 dropbearmulti_x86_64 dropbearmulti_x64 dropbear_amd64 dropbear_x86_64 dropbear_x64 dropbearmulti dropbear
 dropbearmulti_arm64 dropbearmulti_a64 dropbear_arm64 dropbear_a64
 busybox_amd64 busybox_x86_64 busybox_x64 busybox
@@ -14,3 +16,13 @@ busybox_amd64.tar.gz busybox_x86_64.tar.gz busybox_x64.tar.gz
 busybox_arm64.tar.gz busybox_a64.tar.gz
 sftp-server_amd64 sftp-server_x86_64 sftp-server_x64 sftp-server
 sftp-server_arm64 sftp-server_a64
+initrd_amd64.zst initrd_amd64 initrd_x86_64.zst initrd_x86_64
+initrd_amd64.gz initrd_x86_64.gz
+initrd_arm64.zst initrd_arm64 initrd_aarch64.zst initrd_aarch64
+initrd_arm64.gz initrd_aarch64.gz
+bzImage-busybox bzImage bzImage-bb bb
+Image.gz-busybox Image.gz Image.gz-bb Image-busybox Image-bb Image
+initrd.1 initrd.zst.1 initrd.1.zst initrd-main.zst initrd1 i1
+initrd.2 initrd.zst.2 initrd.2.zst initrd-lib.zst initrd2 i2
+!reinstall.sh re.sh
+!reinstall_rootfs.sh

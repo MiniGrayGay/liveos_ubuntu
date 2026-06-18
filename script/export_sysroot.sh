@@ -6,6 +6,24 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SYSROOT_DIR="$ROOT_DIR/sysroot"
 OUTPUT_DIR="$ROOT_DIR/output"
 TMP_DIR=
+SPLIT=0
+LIB_DIR=
+
+usage() {
+  cat <<'EOF'
+Usage: export_sysroot.sh [--split]
+
+Package the sysroot directory into a zstd-compressed newc cpio initrd.
+
+Options:
+  --split   Emit two initrds instead of one:
+              initrd-<timestamp>.1.zst  everything except the libraries (/lib)
+              initrd-<timestamp>.2.zst  the libraries only (/lib -> usr/lib)
+            The kernel concatenates multiple initrds, so this works around
+            per-file size limits. Pass the .1 image before the .2 image at boot.
+  -h, --help  Show this help and exit.
+EOF
+}
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -75,19 +93,89 @@ unmount_sysroot_mounts() {
   log "All mounts under $SYSROOT_DIR have been unmounted"
 }
 
-next_output_path() {
-  local timestamp output_path
+next_output_base() {
+  local timestamp base
 
   while :; do
     timestamp="$(date +%Y%m%d-%H%M%S)"
-    output_path="$OUTPUT_DIR/initrd-$timestamp.zst"
-    if [ ! -e "$output_path" ]; then
-      printf '%s\n' "$output_path"
+    base="$OUTPUT_DIR/initrd-$timestamp"
+    if [ "$SPLIT" -eq 1 ]; then
+      if [ ! -e "$base.1.zst" ] && [ ! -e "$base.2.zst" ]; then
+        printf '%s\n' "$base"
+        return
+      fi
+    elif [ ! -e "$base.zst" ]; then
+      printf '%s\n' "$base"
       return
     fi
     sleep 1
   done
 }
+
+# Resolve the path (relative to the sysroot, as `find` prints it) that holds the
+# shared libraries. On merged-/usr systems /lib is a symlink to usr/lib, so the
+# real content lives there.
+resolve_lib_dir() {
+  local target
+
+  if [ -L "$SYSROOT_DIR/lib" ]; then
+    target="$(readlink "$SYSROOT_DIR/lib")"
+    target="${target#/}"
+    printf './%s\n' "$target"
+  elif [ -d "$SYSROOT_DIR/lib" ]; then
+    printf './lib\n'
+  else
+    die "no lib directory found in sysroot: $SYSROOT_DIR/lib"
+  fi
+}
+
+# create_initrd <destination.zst> <all|no-lib|lib>
+create_initrd() {
+  local dest=$1 mode=$2
+  local tmp
+  tmp="$TMP_DIR/$(basename "$dest")"
+
+  log "Creating archive $dest"
+  (
+    cd "$SYSROOT_DIR"
+    case "$mode" in
+      all)
+        find . -print0
+        ;;
+      no-lib)
+        find . -path "$LIB_DIR" -prune -o -print0
+        ;;
+      lib)
+        find "$LIB_DIR" -print0
+        ;;
+      *)
+        die "unknown archive mode: $mode"
+        ;;
+    esac \
+      | LC_ALL=C sort -z \
+      | cpio --null -o -H newc --quiet --reproducible \
+      | zstd -T0 -19 -o "$tmp"
+  )
+  mv "$tmp" "$dest"
+  log "Created $dest ($(stat -c '%s bytes' "$dest"))"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --split)
+      SPLIT=1
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "unknown argument: $1"
+      ;;
+  esac
+  shift
+done
 
 trap cleanup EXIT
 
@@ -102,22 +190,22 @@ require_command zstd
 require_command sort
 require_command mktemp
 require_command stat
+if [ "$SPLIT" -eq 1 ]; then
+  require_command readlink
+fi
 
-OUTPUT_PATH="$(next_output_path)"
+OUTPUT_BASE="$(next_output_base)"
 TMP_DIR="$(mktemp -d "$OUTPUT_DIR/.initrd-export.XXXXXX")"
-TMP_OUTPUT_PATH="$TMP_DIR/$(basename "$OUTPUT_PATH")"
 
 log "Preparing to export $SYSROOT_DIR"
 unmount_sysroot_mounts
 
-log "Creating archive $OUTPUT_PATH"
-(
-  cd "$SYSROOT_DIR"
-  find . -print0 \
-    | LC_ALL=C sort -z \
-    | cpio --null -o -H newc --quiet --reproducible \
-    | zstd -T0 -19 -o "$TMP_OUTPUT_PATH"
-)
-
-mv "$TMP_OUTPUT_PATH" "$OUTPUT_PATH"
-log "Created $OUTPUT_PATH ($(stat -c '%s bytes' "$OUTPUT_PATH"))"
+if [ "$SPLIT" -eq 1 ]; then
+  LIB_DIR="$(resolve_lib_dir)"
+  log "Splitting initrd; libraries live in $LIB_DIR"
+  create_initrd "$OUTPUT_BASE.1.zst" no-lib
+  create_initrd "$OUTPUT_BASE.2.zst" lib
+  log "Split complete; at boot load $(basename "$OUTPUT_BASE.1.zst") before $(basename "$OUTPUT_BASE.2.zst")"
+else
+  create_initrd "$OUTPUT_BASE.zst" all
+fi

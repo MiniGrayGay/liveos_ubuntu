@@ -22,7 +22,7 @@ KNOWN_TARGETS := \
 	help scripts logs status \
 	configs configs-mod configs-all \
 	kernel kernel-mod kernel-both kernel-all \
-	busybox-static dropbear-static sftp-static static-tools ensure-static-tools \
+	busybox-static busybox-mipsel-static dropbear-static sftp-static static-tools ensure-static-tools \
 	ubuntu-base setup-sysroot setup-sysroot-ask setup-sysroot-keep export-sysroot initrd sysroot rootfs \
 	grub4dos-framework iso pack-iso \
 	qemu qemu-gui qemu-dry-run \
@@ -55,7 +55,7 @@ UBUNTU_BASE_TARBALL ?= $(notdir $(UBUNTU_BASE_URL))
 .PHONY: help scripts logs status
 .PHONY: configs configs-mod configs-all
 .PHONY: kernel kernel-mod kernel-both kernel-all
-.PHONY: busybox-static dropbear-static sftp-static static-tools ensure-static-tools
+.PHONY: busybox-static busybox-mipsel-static dropbear-static sftp-static static-tools ensure-static-tools
 .PHONY: ubuntu-base setup-sysroot setup-sysroot-ask setup-sysroot-keep export-sysroot initrd sysroot rootfs
 .PHONY: grub4dos-framework iso pack-iso
 .PHONY: qemu qemu-gui qemu-dry-run
@@ -107,12 +107,16 @@ status: ## Show key artifacts and git status
 	@ls -lh \
 		"$(ROOT_DIR)/busybox" \
 		"$(ROOT_DIR)/busybox_aarch64" \
+		"$(ROOT_DIR)/busybox_mipsel_mt7621" \
+		"$(ROOT_DIR)/busybox_mipsel_mt7621_upx" \
 		"$(ROOT_DIR)/dropbearmulti" \
 		"$(ROOT_DIR)/dropbearmulti_aarch64" \
 		"$(ROOT_DIR)/sftp-server" \
 		"$(ROOT_DIR)/sftp-server_aarch64" \
 		"$(ROOT_DIR)/build/busybox-static/artifacts/busybox" \
 		"$(ROOT_DIR)/build/busybox-static/artifacts/busybox_aarch64" \
+		"$(ROOT_DIR)/build/busybox-mipsel-static/artifacts/busybox_mipsel_mt7621" \
+		"$(ROOT_DIR)/build/busybox-mipsel-static/artifacts/busybox_mipsel_mt7621_upx" \
 		"$(ROOT_DIR)/build/dropbear-static/artifacts/dropbearmulti" \
 		"$(ROOT_DIR)/build/dropbear-static/artifacts/dropbearmulti_aarch64" \
 		"$(ROOT_DIR)/build/openssh-static/artifacts/sftp-server" \
@@ -143,6 +147,9 @@ kernel-all: ## Build all configured kernel series and flavors
 
 busybox-static: ## Build static BusyBox
 	$(call run_logged,JOBS=$(JOBS) "$(ROOT_DIR)/script/build_static_busybox.sh","$(OUTPUT_DIR)/build-busybox.log")
+
+busybox-mipsel-static: ## Build MT7621/mipsel static BusyBox, UPX copy, and qemu validation
+	$(call run_logged,JOBS=$(JOBS) "$(ROOT_DIR)/script/build_static_busybox_mipsel.sh","$(OUTPUT_DIR)/build-busybox-mipsel.log")
 
 dropbear-static: ## Build static dropbearmulti
 	$(call run_logged,JOBS=$(JOBS) "$(ROOT_DIR)/script/build_static_dropbearmulti.sh","$(OUTPUT_DIR)/build-dropbearmulti.log")

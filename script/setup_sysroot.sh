@@ -920,15 +920,36 @@ echo "Configured root password"
 
 rm -rf \
   "$SYSROOT_DIR/etc/systemd/system/serial-getty@.service.d" \
-  "$SYSROOT_DIR/etc/systemd/system/serial-getty@ttyS0.service.d"
+  "$SYSROOT_DIR/etc/systemd/system/serial-getty@ttyS0.service.d" \
+  "$SYSROOT_DIR/etc/systemd/system/getty@tty1.service.d" \
+  "$SYSROOT_DIR/etc/systemd/system/getty@ttyS0.service.d"
+rm -f \
+  "$SYSROOT_DIR/etc/systemd/system/getty.target.wants/getty@tty1.service" \
+  "$SYSROOT_DIR/etc/systemd/system/getty.target.wants/getty@ttyS0.service" \
+  "$SYSROOT_DIR/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service" \
+  "$SYSROOT_DIR/etc/systemd/system/getty.target.wants/root-shell@tty1.service" \
+  "$SYSROOT_DIR/etc/systemd/system/getty.target.wants/root-shell@ttyS0.service" \
+  "$SYSROOT_DIR/etc/systemd/system/root-shell@.service"
+
 mkdir -p "$SYSROOT_DIR/etc/systemd/system/getty@tty1.service.d"
 cat >"$SYSROOT_DIR/etc/systemd/system/getty@tty1.service.d/autologin-root.conf" <<'EOF'
 [Service]
 ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
+ExecStart=-/usr/sbin/agetty --autologin root --noclear %I $TERM
 TTYVTDisallocate=no
 EOF
-echo "Configured getty@tty1 root autologin override"
+
+mkdir -p "$SYSROOT_DIR/etc/systemd/system/getty@ttyS0.service.d"
+cat >"$SYSROOT_DIR/etc/systemd/system/getty@ttyS0.service.d/autologin-root.conf" <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/usr/sbin/agetty --autologin root --noclear --keep-baud 115200,57600,38400,9600 %I $TERM
+EOF
+
+mkdir -p "$SYSROOT_DIR/etc/systemd/system/getty.target.wants"
+ln -sfn /lib/systemd/system/getty@.service "$SYSROOT_DIR/etc/systemd/system/getty.target.wants/getty@tty1.service"
+ln -sfn /lib/systemd/system/getty@.service "$SYSROOT_DIR/etc/systemd/system/getty.target.wants/getty@ttyS0.service"
+echo "Configured root autologin gettys on tty1 and ttyS0"
 
 BUSYBOX_SRC="$(
   find_artifact busybox \

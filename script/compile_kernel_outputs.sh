@@ -5,15 +5,17 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 KERNEL_DIR="$ROOT_DIR/kernel"
 OUTPUT_DIR="$ROOT_DIR/output"
 SOURCE_CACHE_DIR="$ROOT_DIR/tmp/kernel-source-cache"
+BUSYBOX_ARTIFACT_DIR="$ROOT_DIR/build/busybox-static/artifacts"
 JOBS=${JOBS:-$(nproc)}
 TMP_WORK_ROOT=""
+BUILTIN_BUSYBOX=0
 
 # shellcheck source=/root/kernel/script/kernel_source_matrix.sh
 source "$ROOT_DIR/script/kernel_source_matrix.sh"
 
 usage() {
   cat <<'EOF'
-Usage: compile_kernel_outputs.sh [--aarch64|--x86_64] [--mod|--std|--both] [version|version-mod|x.y.z|/path/to/linux-source ...]
+Usage: compile_kernel_outputs.sh [--aarch64|--x86_64] [--mod|--std|--both] [--builtin-busybox] [version|version-mod|x.y.z|/path/to/linux-source ...]
 
 Without arguments:
   Build all configured series in both standard and modular flavors using the
@@ -26,6 +28,12 @@ With arguments:
   --aarch64       Build arm64/aarch64 kernel images. Outputs are written to
                   output/<version>-aarch64 and output/<version>-aarch64-mod.
   --x86_64        Build x86_64 kernel images (default)
+  --builtin-busybox
+                  Embed the static busybox as a built-in initramfs (via
+                  CONFIG_INITRAMFS_SOURCE) so the kernel image boots straight
+                  to a busybox shell with no external initrd. Requires the
+                  static busybox artifacts from script/build_static_busybox.sh.
+                  Outputs are written to output/<version>-busybox[-mod].
   5.10            Build standard and modular outputs for the latest active
                   5.10.y release from kernel.org
   6.18-mod        Build only the modular output for series 6.18 using
@@ -44,6 +52,8 @@ Examples:
   ./script/compile_kernel_outputs.sh 6.18.22
   ./script/compile_kernel_outputs.sh --mod 6.18.22
   ./script/compile_kernel_outputs.sh --aarch64 6.18
+  ./script/compile_kernel_outputs.sh --builtin-busybox 6.18
+  ./script/compile_kernel_outputs.sh --aarch64 --builtin-busybox --std 7.1
   ./script/compile_kernel_outputs.sh /tmp/linux-6.19.11.tar.xz
 EOF
 }
@@ -252,6 +262,80 @@ require_arch_tools() {
   fi
 }
 
+busybox_binary_for_arch() {
+  local target_arch=$1
+  local candidate
+
+  case "$target_arch" in
+    x86_64) set -- "$BUSYBOX_ARTIFACT_DIR/busybox" "$ROOT_DIR/edgeone/busybox_amd64" ;;
+    aarch64) set -- "$BUSYBOX_ARTIFACT_DIR/busybox_aarch64" "$ROOT_DIR/edgeone/busybox_arm64" ;;
+    *) return 1 ;;
+  esac
+
+  for candidate in "$@"; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# Build a gen_init_cpio listing that embeds the static busybox plus a minimal
+# /init and the device nodes needed to reach a shell. CONFIG_INITRAMFS_SOURCE
+# points the kernel build at this listing, so the image carries its own
+# initramfs (no external initrd). A listing file is used rather than a staging
+# directory so the device nodes can be declared without root privileges.
+prepare_builtin_busybox_initramfs() {
+  local target_arch=$1
+  local build_dir=$2
+  local busybox_bin staging init_script list_file
+
+  busybox_bin=$(busybox_binary_for_arch "$target_arch") || {
+    printf 'error: static busybox for %s not found under %s; run script/build_static_busybox.sh first\n' \
+      "$target_arch" "$BUSYBOX_ARTIFACT_DIR" >&2
+    return 1
+  }
+
+  staging="$build_dir/initramfs"
+  init_script="$staging/init"
+  list_file="$build_dir/initramfs.list"
+
+  rm -rf "$staging"
+  mkdir -p "$staging"
+
+  cat >"$init_script" <<'INIT'
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+mount -t proc     none /proc 2>/dev/null
+mount -t sysfs    none /sys  2>/dev/null
+mount -t devtmpfs none /dev  2>/dev/null
+echo
+echo "==> Built-in busybox initramfs ready ($(uname -srm))"
+echo
+exec /bin/busybox sh
+INIT
+  chmod 0755 "$init_script"
+
+  cat >"$list_file" <<EOF
+dir /bin 755 0 0
+dir /sbin 755 0 0
+dir /proc 755 0 0
+dir /sys 755 0 0
+dir /dev 755 0 0
+file /init $init_script 755 0 0
+file /bin/busybox $busybox_bin 755 0 0
+slink /bin/sh busybox 777 0 0
+nod /dev/console 600 0 0 c 5 1
+nod /dev/null 666 0 0 c 1 3
+nod /dev/tty 666 0 0 c 5 0
+nod /dev/ttyS0 660 0 0 c 4 64
+EOF
+
+  printf '%s\n' "$list_file"
+}
+
 build_one() {
   local display_ver=$1
   local config_ver=$2
@@ -263,6 +347,8 @@ build_one() {
   local config_suffix=""
   local output_name="$display_ver"
   local arch_suffix=""
+  local busybox_suffix=""
+  local initramfs_list=""
   local modules_enabled=0
   local loadable_modules_enabled=0
 
@@ -270,11 +356,15 @@ build_one() {
     arch_suffix="-aarch64"
   fi
 
+  if [[ "$BUILTIN_BUSYBOX" -eq 1 ]]; then
+    busybox_suffix="-busybox"
+  fi
+
   if [[ "$flavor" == "modular" ]]; then
     config_suffix="-modular"
-    output_name="${display_ver}${arch_suffix}-mod"
+    output_name="${display_ver}${arch_suffix}${busybox_suffix}-mod"
   else
-    output_name="${display_ver}${arch_suffix}"
+    output_name="${display_ver}${arch_suffix}${busybox_suffix}"
   fi
 
   if [[ "$display_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -310,6 +400,14 @@ build_one() {
   mkdir -p "$build_dir"
 
   cp "$config_path" "$build_dir/.config"
+
+  if [[ "$BUILTIN_BUSYBOX" -eq 1 ]]; then
+    initramfs_list=$(prepare_builtin_busybox_initramfs "$target_arch" "$build_dir") || exit 1
+    "$source_dir/scripts/config" --file "$build_dir/.config" \
+      --enable BLK_DEV_INITRD \
+      --set-str INITRAMFS_SOURCE "$initramfs_list"
+    echo "==> Embedding static busybox initramfs via CONFIG_INITRAMFS_SOURCE=$initramfs_list"
+  fi
 
   make -C "$source_dir" O="$build_dir" "${make_vars[@]}" olddefconfig
   if grep -q '^CONFIG_MODULES=y' "$build_dir/.config"; then
@@ -354,6 +452,10 @@ build_one() {
     fi
     printf 'kernelrelease=%s\n' "$kernelrelease"
     printf 'jobs=%s\n' "$JOBS"
+    printf 'builtin_busybox=%s\n' "$BUILTIN_BUSYBOX"
+    if [[ "$BUILTIN_BUSYBOX" -eq 1 ]]; then
+      printf 'initramfs_source=%s\n' "$initramfs_list"
+    fi
     printf 'modules_enabled=%s\n' "$modules_enabled"
     printf 'loadable_modules_enabled=%s\n' "$loadable_modules_enabled"
     if [[ "$loadable_modules_enabled" -eq 1 ]]; then
@@ -439,6 +541,14 @@ main() {
         ;;
       --x86_64|--amd64|--x86)
         target_arch=x86_64
+        continue
+        ;;
+      --builtin-busybox)
+        BUILTIN_BUSYBOX=1
+        continue
+        ;;
+      --no-builtin-busybox)
+        BUILTIN_BUSYBOX=0
         continue
         ;;
       -h|--help)
